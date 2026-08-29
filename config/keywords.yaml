@@ -1,10 +1,3 @@
-# Keywords used to match GosZakup lots (nameRu/nameKz/descriptionRu/descriptionKz,
-# TrdBuy.nameRu/nameKz, Plans.descRu/descKz/extraDescRu/extraDescKz).
-#
-# Matching is done locally (see app/filters/keyword_filter.py) after normalization
-# (NFKC, casefold, ё->е, whitespace collapse). Intentional misspellings are kept
-# because real GosZakup listings sometimes contain them. Only exact duplicates
-# were removed from the original list.
 
 keywords:
   - "стеллаж"
