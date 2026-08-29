@@ -23,7 +23,7 @@ from app.telegram.client import TelegramClient
 KEYWORDS_PATH = Path(__file__).resolve().parent.parent / "config" / "keywords.yaml"
 
 
-def _make_lot(lot_id: int, name: str, end_date_iso: str, amount: float = 100000.0) -> dict[str, Any]:
+def _make_lot(lot_id: int, name: str, end_date_iso: str, amount: float = 150000.0) -> dict[str, Any]:
     return {
         "id": lot_id,
         "lotNumber": f"LOT-{lot_id}",
@@ -117,6 +117,9 @@ def settings(tmp_path) -> Settings:
         database_path=tmp_path / "test.db",
         bootstrap_lookback_days=90,
         sync_overlap_minutes=10,
+        discovery_scan_interval_minutes=120,
+        discovery_lookback_days=90,
+        min_amount_kzt=100000,
         log_level="INFO",
         keywords_path=KEYWORDS_PATH,
     )
@@ -180,6 +183,31 @@ async def test_non_matching_lot_is_ignored(settings: Settings):
 
     assert len(transport.sent_messages) == 0
     assert await repo.get_tender(2) is None
+
+    await conn.close()
+    await goszakup.close()
+    await telegram.close()
+
+
+async def test_amount_at_exactly_threshold_is_rejected_and_not_stored(settings: Settings):
+    now = datetime.now(timezone.utc)
+    end = (now + timedelta(hours=30)).strftime("%Y-%m-%d %H:%M:%S")
+    lots = [_make_lot(4, "Стеллаж металлический архивный", end, amount=100000.0)]
+    transport = RecordingTransport(lots)
+
+    conn = await init_db(settings.database_path)
+    repo = Repository(conn)
+    kf = KeywordFilter.from_yaml(settings.keywords_path)
+    goszakup = GoszakupClient(settings.goszakup_graphql_url, settings.goszakup_api_token)
+    goszakup._client = httpx.AsyncClient(transport=transport)
+    telegram = TelegramClient(settings.telegram_api_base, settings.telegram_bot_token)
+    telegram._client = httpx.AsyncClient(transport=transport)
+
+    monitor = MonitorService(settings, repo, goszakup, telegram, kf, settings.telegram_chat_id)
+    await monitor.run_incremental_sync()
+
+    assert len(transport.sent_messages) == 0
+    assert await repo.get_tender(4) is None  # rejected before ever being stored
 
     await conn.close()
     await goszakup.close()

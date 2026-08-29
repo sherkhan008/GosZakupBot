@@ -9,7 +9,13 @@ data/*.db
 data/*.db-journal
 data/*.db-wal
 data/*.db-shm
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
 .pytest_cache/
 *.egg-info/
 .vscode/
 .idea/
+logs/
+*.log

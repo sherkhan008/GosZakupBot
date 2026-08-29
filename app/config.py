@@ -33,6 +33,16 @@ def _str_env(name: str, default: str = "") -> str:
     return val.strip()
 
 
+def _float_env(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
 @dataclass(frozen=True)
 class Settings:
     goszakup_api_token: str
@@ -48,6 +58,11 @@ class Settings:
 
     bootstrap_lookback_days: int
     sync_overlap_minutes: int
+
+    discovery_scan_interval_minutes: int
+    discovery_lookback_days: int
+
+    min_amount_kzt: float
 
     log_level: str
 
@@ -78,5 +93,8 @@ def load_settings() -> Settings:
         database_path=database_path,
         bootstrap_lookback_days=_int_env("BOOTSTRAP_LOOKBACK_DAYS", 90),
         sync_overlap_minutes=_int_env("SYNC_OVERLAP_MINUTES", 10),
+        discovery_scan_interval_minutes=_int_env("DISCOVERY_SCAN_INTERVAL_MINUTES", 120),
+        discovery_lookback_days=_int_env("DISCOVERY_LOOKBACK_DAYS", 90),
+        min_amount_kzt=_float_env("MIN_AMOUNT_KZT", 100000),
         log_level=_str_env("LOG_LEVEL", "INFO"),
     )

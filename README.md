@@ -62,26 +62,47 @@ Press `Ctrl+C`.
 | Check interval (default 5 min) | `.env` → `CHECK_INTERVAL_SECONDS` |
 | Timezone | `.env` → `APP_TIMEZONE` (default `Asia/Qyzylorda`) |
 | How far back the first sync looks | `.env` → `BOOTSTRAP_LOOKBACK_DAYS` (default 90) |
+| Periodic full keyword re-scan interval | `.env` → `DISCOVERY_SCAN_INTERVAL_MINUTES` (default 120) |
+| How far back each re-scan looks | `.env` → `DISCOVERY_LOOKBACK_DAYS` (default 90) |
+| Minimum amount to send (exclusive) | `.env` → `MIN_AMOUNT_KZT` (default 100000) |
 
 ## How it works, briefly
 
-1. Every cycle, the bot asks GosZakup for lots updated since the last
-   successful sync (with a small overlap window so nothing is missed near
-   the boundary) whose name/description matches one of the configured
-   keywords.
-2. Every match is checked locally against `config/keywords.yaml` (the API's
-   search is only used to narrow candidates — the final match decision is
-   always made locally, case-insensitively, ignoring the `ё`/`е` distinction).
-3. Matches are stored in SQLite as `pending`. Every cycle also re-checks all
-   `pending` tenders, refreshing them from the API.
-4. A tender is sent to Telegram, **exactly once**, the moment its remaining
-   time to the application deadline is between 5 and 72 hours (inclusive).
-   Once sent, it's marked `sent` and will never be sent again, even if it
-   changes later. If it would otherwise pass the 5-hour mark without ever
-   having been sent, it's marked `expired` and dropped.
-5. Notifications are sent via a direct Telegram Bot API call and contain only:
-   name, amount, delivery location, deadline, time remaining, and a link to
-   the announcement on goszakup.gov.kz.
+Three independent discovery passes feed the same pipeline:
+
+1. **Incremental sync** (every `CHECK_INTERVAL_SECONDS`, default 5 min): asks
+   GosZakup only for lots updated since the last successful sync (with a
+   small overlap window). Fast and cheap, but can only see tenders GosZakup
+   has recently touched.
+2. **Discovery scan** (every `DISCOVERY_SCAN_INTERVAL_MINUTES`, default 2h):
+   re-searches every configured keyword individually over the last
+   `DISCOVERY_LOOKBACK_DAYS` days, independent of when the tender was last
+   updated. This exists because a tender's "last updated" timestamp reflects
+   when GosZakup last edited it, not when its deadline enters the 5–72h
+   window — a tender published weeks ago and never touched again would
+   otherwise be invisible to incremental sync alone.
+3. **Pending check** (every cycle): re-fetches every tender currently stored
+   as `pending` by id, so one already discovered by either pass above keeps
+   getting its deadline re-evaluated until it's sent or expires.
+
+For every candidate, regardless of which pass found it:
+- The final keyword decision checks **only the tender's title** (`nameRu` /
+  `nameKz`) — the API's own search may use name+description to find
+  candidates, but a match only counts if the keyword appears in the title
+  itself.
+- It must have `amount` strictly greater than `MIN_AMOUNT_KZT`.
+- It's stored in SQLite as `pending`, then sent to Telegram **exactly once**
+  the moment its remaining time to the application deadline is between 5 and
+  72 hours (inclusive). Once sent, it's marked `sent` and never sent again,
+  even if it changes later. If it would otherwise pass the 5-hour mark
+  without ever having been sent, it's marked `expired` and dropped.
+- Notifications are sent via a direct Telegram Bot API call and contain only:
+  name, amount, delivery location, deadline, time remaining, and a link to
+  the announcement on goszakup.gov.kz.
+
+Each pass logs a one-line summary (`INCREMENTAL SYNC SUMMARY` / `DISCOVERY
+SUMMARY` / `PENDING CHECK SUMMARY` / `BOOTSTRAP SUMMARY`) with counts for
+requests, failures, matches, and outcomes (sent/pending/expired/rejected).
 
 ## Running tests
 

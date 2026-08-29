@@ -141,7 +141,11 @@ def parse_lot(raw: dict[str, Any]) -> Lot:
 
 
 def candidate_text_fields(lot: Lot) -> list[Optional[str]]:
-    """All text fields keyword matching should search, per spec section 7."""
+    """All text fields the server-side/legacy search considered (kept for
+    reference and tests). NOT used for the final match decision -- see
+    title_fields() below, which is what MonitorService actually matches
+    against.
+    """
     fields: list[Optional[str]] = [
         lot.name_ru,
         lot.name_kz,
@@ -157,6 +161,17 @@ def candidate_text_fields(lot: Lot) -> list[Optional[str]]:
         fields.append(plan.extra_desc_ru)
         fields.append(plan.extra_desc_kz)
     return fields
+
+
+def title_fields(lot: Lot) -> list[Optional[str]]:
+    """The final keyword-match decision is title-only: Lots.nameRu / Lots.nameKz.
+
+    Server-side GosZakup search (nameDescriptionRu/nameDescriptionKz) may use
+    name+description to find candidates efficiently, but descriptions,
+    TrdBuy names, and Plan descriptions are deliberately excluded here to
+    avoid false positives from unrelated procurement text.
+    """
+    return [lot.name_ru, lot.name_kz]
 
 
 def derive_display_name(lot: Lot) -> str:
