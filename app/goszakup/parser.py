@@ -8,23 +8,35 @@ from __future__ import annotations
 import logging
 from datetime import datetime
 from typing import Any, Optional
+from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
 from app.goszakup.models import Lot, PlanKato, PlanPoint, RefKato, TrdBuy
 
 logger = logging.getLogger(__name__)
 
-# Public GosZakup portal shows lots under the "Лоты" tab of the announcement
-# page; there is no reliable direct per-lot URL, so we link to the
-# announcement and select that tab. Verified format:
-# https://goszakup.gov.kz/ru/announce/index/<trdBuyId>?tab=lots
-PUBLIC_ANNOUNCE_URL_TEMPLATE = "https://goszakup.gov.kz/ru/announce/index/{trd_buy_id}?tab=lots"
+# NOTE (2026-08-30): goszakup.gov.kz / www.goszakup.gov.kz currently fail TLS
+# certificate validation -- the live cert's altnames only cover zakup.gov.kz /
+# *.zakup.gov.kz, indicating the public portal has migrated domains since this
+# URL format was last verified live. Using zakup.gov.kz here because it's the
+# only one of the two that presents a valid certificate; flagged separately
+# for confirmation since the exact routing on the new domain could not be
+# verified end-to-end (the portal is a client-side app and tools available
+# here cannot execute its JS to confirm the search-by-number view renders).
+ANNOUNCE_DOMAIN = "zakup.gov.kz"
+PUBLIC_ANNOUNCE_SEARCH_URL_TEMPLATE = (
+    f"https://{ANNOUNCE_DOMAIN}/ru/search/announce?filter%5Bnumber%5D={{tender_number}}"
+)
 
 
-def build_tender_url(trd_buy_id: Optional[int]) -> str:
-    if not trd_buy_id:
-        return "https://goszakup.gov.kz/"
-    return PUBLIC_ANNOUNCE_URL_TEMPLATE.format(trd_buy_id=trd_buy_id)
+def build_tender_url(tender_number: Optional[str]) -> str:
+    """Link to the announcement, filtered by its number (trdBuyNumberAnno) --
+    NOT the lot number. Falls back to the portal home page if the tender
+    number itself is unavailable.
+    """
+    if not tender_number:
+        return f"https://{ANNOUNCE_DOMAIN}/"
+    return PUBLIC_ANNOUNCE_SEARCH_URL_TEMPLATE.format(tender_number=quote(tender_number, safe=""))
 
 
 _NAIVE_FORMATS = (
@@ -127,6 +139,7 @@ def parse_lot(raw: dict[str, Any]) -> Lot:
     return Lot(
         id=raw["id"],
         lot_number=raw.get("lotNumber"),
+        trd_buy_number_anno=raw.get("trdBuyNumberAnno"),
         name_ru=raw.get("nameRu"),
         name_kz=raw.get("nameKz"),
         description_ru=raw.get("descriptionRu"),
@@ -172,6 +185,19 @@ def title_fields(lot: Lot) -> list[Optional[str]]:
     avoid false positives from unrelated procurement text.
     """
     return [lot.name_ru, lot.name_kz]
+
+
+def derive_tender_number(lot: Lot) -> Optional[str]:
+    """The tender/announcement number (trdBuyNumberAnno) -- NOT the lot
+    number (Lots.lotNumber). Prefers the flat Lots.trdBuyNumberAnno field;
+    falls back to the nested TrdBuy.numberAnno (the same value, denormalized)
+    if the flat field wasn't populated for some reason.
+    """
+    if lot.trd_buy_number_anno:
+        return lot.trd_buy_number_anno
+    if lot.trd_buy and lot.trd_buy.number_anno:
+        return lot.trd_buy.number_anno
+    return None
 
 
 def derive_display_name(lot: Lot) -> str:

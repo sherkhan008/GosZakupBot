@@ -50,3 +50,23 @@ def format_remaining(remaining: timedelta) -> str:
     total_minutes = total_seconds // 60
     hours, minutes = divmod(total_minutes, 60)
     return f"{hours} ч {minutes} мин"
+
+
+def format_remaining_kazakh(remaining: timedelta) -> str:
+    """Format the same remaining-time timedelta (from remaining_timedelta())
+    for the Telegram message's Kazakh countdown line:
+        >= 24h : '1 күн 6 сағат 15 минут'
+        >= 1h  : '6 сағат 15 минут'
+        < 1h   : '45 минут'
+    Never negative -- floored at zero, whole minutes (never rounded up).
+    """
+    total_seconds = max(0, int(remaining.total_seconds()))
+    total_minutes = total_seconds // 60
+    days, rest_minutes = divmod(total_minutes, 24 * 60)
+    hours, minutes = divmod(rest_minutes, 60)
+
+    if days > 0:
+        return f"{days} күн {hours} сағат {minutes} минут"
+    if hours > 0:
+        return f"{hours} сағат {minutes} минут"
+    return f"{minutes} минут"

@@ -6,6 +6,7 @@ from app.filters.deadline_filter import (
     DeadlineStatus,
     classify_deadline,
     format_remaining,
+    format_remaining_kazakh,
     remaining_timedelta,
 )
 
@@ -70,3 +71,37 @@ def test_pending_then_eligible_transition():
 def test_never_sent_and_now_under_5_hours_is_expired():
     status = classify_deadline(timedelta(hours=4), MIN_HOURS, MAX_HOURS)
     assert status == DeadlineStatus.EXPIRED
+
+
+def test_format_remaining_kazakh_over_24_hours():
+    assert format_remaining_kazakh(timedelta(days=1, hours=6, minutes=15)) == "1 күн 6 сағат 15 минут"
+
+
+def test_format_remaining_kazakh_under_24_hours():
+    assert format_remaining_kazakh(timedelta(hours=6, minutes=15)) == "6 сағат 15 минут"
+
+
+def test_format_remaining_kazakh_under_1_hour():
+    assert format_remaining_kazakh(timedelta(minutes=45)) == "45 минут"
+
+
+def test_format_remaining_kazakh_floors_seconds_without_inflating_minutes():
+    assert format_remaining_kazakh(timedelta(minutes=44, seconds=59)) == "44 минут"
+
+
+def test_format_remaining_kazakh_never_shows_negative():
+    assert format_remaining_kazakh(timedelta(hours=-5)) == "0 минут"
+    assert format_remaining_kazakh(timedelta(seconds=-1)) == "0 минут"
+
+
+def test_format_remaining_kazakh_exactly_24_hours_shows_one_day():
+    assert format_remaining_kazakh(timedelta(hours=24)) == "1 күн 0 сағат 0 минут"
+
+
+def test_format_remaining_kazakh_uses_same_timedelta_source_as_deadline_logic():
+    # Same remaining_timedelta() output that drives classify_deadline() must
+    # feed the display formatter -- no separate/duplicate date-diff logic.
+    now = datetime(2026, 1, 1, 10, 0, tzinfo=timezone.utc)
+    end = now + timedelta(days=1, hours=6, minutes=15)
+    remaining = remaining_timedelta(end, now)
+    assert format_remaining_kazakh(remaining) == "1 күн 6 сағат 15 минут"

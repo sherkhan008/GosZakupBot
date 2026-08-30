@@ -11,6 +11,7 @@ from typing import Any, Optional
 LOT_FIELDS = """
     id
     lotNumber
+    trdBuyNumberAnno
     nameRu
     nameKz
     descriptionRu

@@ -43,6 +43,7 @@ from app.goszakup.parser import (
     build_tender_url,
     derive_delivery_place,
     derive_display_name,
+    derive_tender_number,
     format_api_datetime,
     parse_api_datetime,
     parse_lot,
@@ -127,7 +128,8 @@ class MonitorService:
 
         name = derive_display_name(lot)
         delivery_place = derive_delivery_place(lot)
-        url = build_tender_url(lot.trd_buy_id or lot.trd_buy.id)
+        tender_number = derive_tender_number(lot)
+        url = build_tender_url(tender_number)
 
         record = TenderRecord(
             lot_id=lot.id,
@@ -166,6 +168,8 @@ class MonitorService:
         remaining = remaining_timedelta(end_date, now)
         message = build_message(
             name=name,
+            tender_number=tender_number,
+            lot_number=lot.lot_number,
             amount=lot.amount,
             delivery_place=delivery_place,
             end_date=end_date,

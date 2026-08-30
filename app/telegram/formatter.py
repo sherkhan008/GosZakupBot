@@ -1,20 +1,16 @@
-"""Builds the exact 6-field Telegram notification and formats values.
-
-The message must contain ONLY: name, amount, delivery location, deadline,
-remaining time, and link -- nothing else (no customer, lot number, method,
-status, matched keyword, etc.)
-"""
+"""Builds the Telegram tender notification and formats values."""
 from __future__ import annotations
 
 import html
 from datetime import datetime, timedelta
 from typing import Optional
 
-from app.filters.deadline_filter import format_remaining
+from app.filters.deadline_filter import format_remaining_kazakh
 
 AMOUNT_NOT_SPECIFIED = "Не указано"
 DELIVERY_NOT_SPECIFIED = "Не указано"
 NO_NAME = "Без названия"
+NUMBER_NOT_SPECIFIED = "Көрсетілмеген"
 
 
 def escape_html(text: str) -> str:
@@ -39,7 +35,7 @@ def format_amount(amount: Optional[float]) -> str:
 
     grouped = f"{int_part:,}".replace(",", " ")
     frac_text = f",{frac:02d}" if frac else ""
-    return f"{sign}{grouped}{frac_text} ₸"
+    return f"{sign}{grouped}{frac_text} тг"
 
 
 def format_end_date(end_date: datetime) -> str:
@@ -49,6 +45,8 @@ def format_end_date(end_date: datetime) -> str:
 def build_message(
     *,
     name: str,
+    tender_number: Optional[str],
+    lot_number: Optional[str],
     amount: Optional[float],
     delivery_place: str,
     end_date: datetime,
@@ -56,16 +54,21 @@ def build_message(
     url: str,
 ) -> str:
     safe_name = escape_html(name or NO_NAME)
+    safe_tender_number = escape_html(tender_number) if tender_number else NUMBER_NOT_SPECIFIED
+    safe_lot_number = escape_html(lot_number) if lot_number else NUMBER_NOT_SPECIFIED
     safe_delivery = escape_html(delivery_place or DELIVERY_NOT_SPECIFIED)
     amount_text = format_amount(amount)
     end_date_text = format_end_date(end_date)
-    remaining_text = format_remaining(remaining)
+    remaining_text = format_remaining_kazakh(remaining)
 
     return (
-        f"\U0001f4e6 <b>{safe_name}</b>\n\n"
-        f"\U0001f4b0 {amount_text}\n\n"
-        f"\U0001f4cd {safe_delivery}\n\n"
-        f"⏰ Окончание: {end_date_text}\n\n"
-        f"⌛ Осталось: {remaining_text}\n\n"
-        f"\U0001f517 {url}"
+        "🆕 Жаңа тендер\n\n"
+        f"📌 Атауы: {safe_name}\n"
+        f"🔢 Тендер нөмірі: {safe_tender_number}\n"
+        f"📋 Лот нөмірі: {safe_lot_number}\n"
+        f"💰 Сомасы: {amount_text}\n"
+        f"⏳ Аяқталу уақыты: {end_date_text}\n"
+        f"⏱ Қалған уақыт: {remaining_text}\n"
+        f"📍 Жеткізу орны: {safe_delivery}\n\n"
+        f"🔗 Тендерді ашу:\n{url}"
     )

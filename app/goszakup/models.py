@@ -51,6 +51,7 @@ class TrdBuy:
 class Lot:
     id: int
     lot_number: Optional[str] = None
+    trd_buy_number_anno: Optional[str] = None  # announcement/tender number -- NOT the lot number
     name_ru: Optional[str] = None
     name_kz: Optional[str] = None
     description_ru: Optional[str] = None
