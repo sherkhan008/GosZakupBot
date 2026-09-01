@@ -8,35 +8,27 @@ from __future__ import annotations
 import logging
 from datetime import datetime
 from typing import Any, Optional
-from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
 from app.goszakup.models import Lot, PlanKato, PlanPoint, RefKato, TrdBuy
 
 logger = logging.getLogger(__name__)
 
-# NOTE (2026-08-30): goszakup.gov.kz / www.goszakup.gov.kz currently fail TLS
-# certificate validation -- the live cert's altnames only cover zakup.gov.kz /
-# *.zakup.gov.kz, indicating the public portal has migrated domains since this
-# URL format was last verified live. Using zakup.gov.kz here because it's the
-# only one of the two that presents a valid certificate; flagged separately
-# for confirmation since the exact routing on the new domain could not be
-# verified end-to-end (the portal is a client-side app and tools available
-# here cannot execute its JS to confirm the search-by-number view renders).
-ANNOUNCE_DOMAIN = "zakup.gov.kz"
-PUBLIC_ANNOUNCE_SEARCH_URL_TEMPLATE = (
-    f"https://{ANNOUNCE_DOMAIN}/ru/search/announce?filter%5Bnumber%5D={{tender_number}}"
-)
+# The old zakup.gov.kz "search by number" URL (filter[number]=<trdBuyNumberAnno>)
+# 404s on the current portal. The live announcement page is addressed by the
+# announcement's real database id (trdBuyId), not by its display number.
+PROCUREMENT_DOMAIN = "procurement.gov.kz"
 
 
-def build_tender_url(tender_number: Optional[str]) -> str:
-    """Link to the announcement, filtered by its number (trdBuyNumberAnno) --
-    NOT the lot number. Falls back to the portal home page if the tender
-    number itself is unavailable.
+def build_tender_url(trd_buy_id: Optional[int]) -> Optional[str]:
+    """Link to the announcement page by its real id (Lots.trdBuyId / TrdBuy.id
+    from the GosZakup API) -- NEVER trdBuyNumberAnno or lotNumber, which are
+    display-only numbers (e.g. "17549703-1") and not database ids, and must
+    never be parsed/stripped to derive one.
     """
-    if not tender_number:
-        return f"https://{ANNOUNCE_DOMAIN}/"
-    return PUBLIC_ANNOUNCE_SEARCH_URL_TEMPLATE.format(tender_number=quote(tender_number, safe=""))
+    if trd_buy_id is None:
+        return None
+    return f"https://{PROCUREMENT_DOMAIN}/ru/announce/index/{trd_buy_id}"
 
 
 _NAIVE_FORMATS = (
@@ -197,6 +189,19 @@ def derive_tender_number(lot: Lot) -> Optional[str]:
         return lot.trd_buy_number_anno
     if lot.trd_buy and lot.trd_buy.number_anno:
         return lot.trd_buy.number_anno
+    return None
+
+
+def derive_trd_buy_id(lot: Lot) -> Optional[int]:
+    """The real TrdBuy id used to build the announcement URL -- prefers the
+    flat Lots.trdBuyId field; falls back to the nested TrdBuy.id (the same
+    value, denormalized) if the flat field wasn't populated for some reason.
+    NEVER derived from trdBuyNumberAnno/lotNumber (display-only numbers).
+    """
+    if lot.trd_buy_id is not None:
+        return lot.trd_buy_id
+    if lot.trd_buy and lot.trd_buy.id is not None:
+        return lot.trd_buy.id
     return None
 
 

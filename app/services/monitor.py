@@ -1,23 +1,40 @@
 """Core monitoring service.
 
-Three independent discovery mechanisms feed the same ingestion pipeline:
+BUSINESS RULE: a tender is eligible for exactly three reasons -- keyword in
+its title, amount > MIN_AMOUNT_KZT, and 5-72h remaining until its deadline.
+lastUpdateDate is NEVER part of that decision. A tender last touched by
+GosZakup a year ago must be found and sent just as readily as one updated a
+minute ago, as long as it still matches on those three criteria.
 
-  - Bootstrap (services/bootstrap.py): one-time historical load, runs once
-    per database lifetime, tracked by app_state.bootstrap_completed.
-  - Incremental sync (run_incremental_sync): fast, frequent (every
-    CHECK_INTERVAL_SECONDS), scans only lots whose lastUpdateDate falls in
-    the delta window since the last successful sync.
-  - Discovery scan (run_discovery_scan): slower, periodic (every
-    DISCOVERY_SCAN_INTERVAL_MINUTES), re-scans ALL 92 keywords independently
-    of lastUpdateDate. This exists because a tender's lastUpdateDate reflects
-    when GosZakup last *edited* it, not when its deadline enters the 5-72h
-    window -- a tender published weeks ago with an untouched lastUpdateDate
-    would never surface via incremental sync alone. Discovery scan re-finds
-    it the same way bootstrap originally would have.
+Discovery scan (run_discovery_scan) is therefore the PRIMARY, authoritative
+detection mechanism: it re-searches every one of the 92 keywords with NO
+lastUpdateDate filter at all, every DISCOVERY_SCAN_INTERVAL_MINUTES, so it
+finds every currently-matching tender regardless of how long ago it was last
+edited. Correctness of the whole system depends only on discovery scan (plus
+ingest_lot's amount/deadline/dedup checks) -- everything else is optional:
 
-All three funnel into ingest_lot(), which evaluates title-only keyword
-relevance already applied upstream, the amount filter, the 5-72h deadline
-window, and duplicate protection, then sends via Telegram exactly once.
+  - Bootstrap (services/bootstrap.py): one-time historical load on first
+    start, tracked by app_state.bootstrap_completed. Superseded within
+    minutes by the first discovery scan anyway; kept only to get useful
+    results slightly faster on a brand new deployment.
+  - Incremental sync (run_incremental_sync): a supplementary fast-path, not
+    authoritative. It scans only lots whose lastUpdateDate falls in the delta
+    window since the last successful sync, purely as a latency optimization
+    (catching freshly-touched tenders within minutes instead of waiting for
+    the next discovery cycle). The system is fully correct even with this
+    disabled or failing indefinitely -- discovery scan alone guarantees every
+    matching tender is eventually found.
+  - Pending check (run_pending_check): re-evaluates tenders already stored as
+    'pending' by id, purely as an optimization so a >72h tender doesn't have
+    to wait for the next full discovery scan once its deadline enters the
+    window. Not required for correctness either -- if a pending row were
+    ever lost, the next discovery scan would simply rediscover that same lot
+    by keyword and re-evaluate it from scratch, since discovery scan does not
+    consult or depend on pending/database state to decide what to search for.
+
+All paths funnel into ingest_lot(), which evaluates the amount filter, the
+5-72h deadline window, and duplicate protection, then sends via Telegram
+exactly once.
 """
 from __future__ import annotations
 
@@ -44,6 +61,7 @@ from app.goszakup.parser import (
     derive_delivery_place,
     derive_display_name,
     derive_tender_number,
+    derive_trd_buy_id,
     format_api_datetime,
     parse_api_datetime,
     parse_lot,
@@ -63,6 +81,7 @@ logger = logging.getLogger(__name__)
 LAST_SYNC_KEY = "last_successful_sync"
 BOOTSTRAP_DONE_KEY = "bootstrap_completed"
 LAST_DISCOVERY_SCAN_KEY = "last_discovery_scan"
+LAST_CLEANUP_KEY = "last_cleanup_at"
 
 PAGE_LIMIT = 200  # documented GosZakup V3 maximum page size
 KEYWORD_SEARCH_CONCURRENCY = 4  # conservative: 3-5 simultaneous requests
@@ -129,12 +148,13 @@ class MonitorService:
         name = derive_display_name(lot)
         delivery_place = derive_delivery_place(lot)
         tender_number = derive_tender_number(lot)
-        url = build_tender_url(tender_number)
+        trd_buy_id = derive_trd_buy_id(lot)
+        url = build_tender_url(trd_buy_id)
 
         record = TenderRecord(
             lot_id=lot.id,
             lot_number=lot.lot_number,
-            trd_buy_id=lot.trd_buy_id,
+            trd_buy_id=trd_buy_id,
             name=name,
             amount=lot.amount,
             end_date=end_date.isoformat(),
@@ -208,9 +228,11 @@ class MonitorService:
     ) -> tuple[dict[int, Lot], dict[str, Any]]:
         """Search GosZakup one keyword at a time (String, never a list) across
         both language fields, with pagination per query and concurrency
-        limited via a semaphore. Used by BOTH the one-time bootstrap and the
-        recurring discovery scan -- the only difference between them is the
-        date window and what happens to the checkpoints afterwards.
+        limited via a semaphore. Used by BOTH the one-time bootstrap (with a
+        bounded lastUpdateDate window, purely to keep the very first run
+        fast) and the recurring discovery scan (with last_update_range=None
+        -- no date bound at all, since discovery scan is the authoritative,
+        lastUpdateDate-independent detection mechanism).
 
         Returns (matches, fetch_stats) where fetch_stats carries the raw
         funnel numbers (requests issued/failed, lots received/deduped).
@@ -335,7 +357,11 @@ class MonitorService:
         summary = dict(fetch_stats)
         summary["keyword_matches"] = len(matches)
         summary["rejected_amount"] = counts[OUTCOME_AMOUNT_REJECTED]
-        summary["expired"] = counts[OUTCOME_EXPIRED]
+        # "rejected_deadline" = remaining time < MIN_HOURS_REMAINING (DB status
+        # stays 'expired' internally; the funnel label reflects the business
+        # framing that this is a deadline-window rejection, not an
+        # lastUpdateDate-driven "staleness" concept).
+        summary["rejected_deadline"] = counts[OUTCOME_EXPIRED]
         summary["pending"] = counts[OUTCOME_PENDING] + counts[OUTCOME_SEND_FAILED]
         summary["already_sent"] = counts[OUTCOME_ALREADY_SENT]
         summary["telegram_sent"] = counts[OUTCOME_SENT]
@@ -372,29 +398,22 @@ class MonitorService:
         logger.info("Incremental sync completed successfully")
 
     async def run_discovery_scan(self) -> None:
-        """Periodic (DISCOVERY_SCAN_INTERVAL_MINUTES) re-scan of ALL keywords
-        over the last DISCOVERY_LOOKBACK_DAYS days, independent of
-        lastUpdateDate. Re-discovers tenders that existed all along but were
-        never touched by GosZakup since they were first published, and whose
-        deadline has now entered (or is approaching) the 5-72h window.
+        """Periodic (DISCOVERY_SCAN_INTERVAL_MINUTES) re-scan of ALL keywords,
+        with NO lastUpdateDate filter whatsoever -- this is the primary,
+        authoritative detection mechanism (see module docstring). A tender
+        last touched by GosZakup a year ago is found here exactly the same
+        way as one touched a minute ago, as long as it still matches by
+        keyword; eligibility is decided afterwards, in ingest_lot(), purely
+        by amount and remaining time.
 
         This is NOT the one-time bootstrap: it runs repeatedly for the life
         of the deployment, tracked by its own last_discovery_scan checkpoint,
         completely independent of bootstrap_completed.
         """
         now = datetime.now(timezone.utc)
-        window_start = now - timedelta(days=self.settings.discovery_lookback_days)
-        from_str = format_api_datetime(window_start, self.settings.app_timezone)
-        to_str = format_api_datetime(now, self.settings.app_timezone)
-
-        logger.info(
-            "Discovery scan started: re-scanning last %d day(s) by keyword (%s -> %s)",
-            self.settings.discovery_lookback_days,
-            from_str,
-            to_str,
-        )
+        logger.info("Discovery scan started: re-scanning all keywords (no lastUpdateDate filter)")
         try:
-            matches, fetch_stats = await self.fetch_keyword_search_matches((from_str, to_str))
+            matches, fetch_stats = await self.fetch_keyword_search_matches(None)
         except GoszakupError:
             logger.error("Discovery scan aborted due to a GosZakup API error; will retry next cycle")
             return
@@ -454,7 +473,7 @@ class MonitorService:
 
         counts = Counter(outcomes)
         logger.info(
-            "PENDING CHECK SUMMARY: checked=%d refreshed=%d missing=%d expired=%d "
+            "PENDING CHECK SUMMARY: checked=%d refreshed=%d missing=%d rejected_deadline=%d "
             "pending=%d telegram_sent=%d amount_rejected=%d",
             len(pending_ids),
             len(refreshed_ids),
@@ -465,7 +484,74 @@ class MonitorService:
             counts[OUTCOME_AMOUNT_REJECTED],
         )
 
+    async def run_cleanup(self) -> None:
+        """Delete old 'expired' tenders (never 'sent'/'pending') older than
+        EXPIRED_RETENTION_DAYS past their end_date. Runs on its own schedule,
+        completely independent of last_successful_sync, last_discovery_scan,
+        and bootstrap_completed.
+
+        Does NOT run VACUUM -- a full VACUUM needs up to ~2x the current file
+        size in free disk space to run safely, which the Railway Volume does
+        not currently have headroom for. Freed pages are added to SQLite's
+        internal freelist and get reused by future INSERTs automatically
+        (this is what actually stops/slows further growth); the file itself
+        will not shrink on disk until a VACUUM is run separately, once there
+        is enough free space to do so safely.
+        """
+        before = await self.repo.get_storage_diagnostics()
+        logger.info(
+            "Cleanup diagnostics (before): database_size_mb=%s freelist_pages=%d reclaimable_mb=%s",
+            before["database_size_mb"],
+            before["freelist_count"],
+            before["reclaimable_mb"],
+        )
+
+        expired_before = await self.repo.count_tenders_by_status(STATUS_EXPIRED)
+        cutoff = datetime.now(timezone.utc) - timedelta(days=self.settings.expired_retention_days)
+        candidate_ids = await self.repo.find_expired_lot_ids_older_than(cutoff)
+
+        deleted = 0
+        if candidate_ids:
+            deleted = await self.repo.delete_tenders_by_ids(candidate_ids)
+
+        after = await self.repo.get_storage_diagnostics()
+        expired_after = await self.repo.count_tenders_by_status(STATUS_EXPIRED)
+
+        logger.info(
+            "CLEANUP SUMMARY: expired_retention_days=%d expired_before=%d deleted=%d "
+            "expired_after=%d database_size_mb=%s freelist_pages=%d reclaimable_mb=%s",
+            self.settings.expired_retention_days,
+            expired_before,
+            deleted,
+            expired_after,
+            after["database_size_mb"],
+            after["freelist_count"],
+            after["reclaimable_mb"],
+        )
+
+        await self.repo.set_app_state(LAST_CLEANUP_KEY, datetime.now(timezone.utc).isoformat())
+
+    async def maybe_run_cleanup(self) -> None:
+        """Run cleanup only if CLEANUP_INTERVAL_HOURS have elapsed since the
+        last run (or it has never run). Uses its own checkpoint
+        (last_cleanup_at) -- never reads or writes last_successful_sync,
+        last_discovery_scan, or bootstrap_completed.
+        """
+        last_raw = await self.repo.get_app_state(LAST_CLEANUP_KEY)
+        if last_raw:
+            last_cleanup = datetime.fromisoformat(last_raw)
+            elapsed_hours = (datetime.now(timezone.utc) - last_cleanup).total_seconds() / 3600
+            if elapsed_hours < self.settings.cleanup_interval_hours:
+                logger.info(
+                    "Cleanup not due yet (%.1f/%d hours elapsed)",
+                    elapsed_hours,
+                    self.settings.cleanup_interval_hours,
+                )
+                return
+        await self.run_cleanup()
+
     async def run_once(self) -> None:
         await self.run_incremental_sync()
         await self.maybe_run_discovery_scan()
         await self.run_pending_check()
+        await self.maybe_run_cleanup()

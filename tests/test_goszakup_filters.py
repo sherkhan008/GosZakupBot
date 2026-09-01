@@ -171,8 +171,9 @@ def settings(tmp_path) -> Settings:
         bootstrap_lookback_days=90,
         sync_overlap_minutes=10,
         discovery_scan_interval_minutes=120,
-        discovery_lookback_days=90,
         min_amount_kzt=100000,
+        expired_retention_days=30,
+        cleanup_interval_hours=24,
         log_level="INFO",
         keywords_path=KEYWORDS_PATH,
     )

@@ -11,6 +11,7 @@ AMOUNT_NOT_SPECIFIED = "Не указано"
 DELIVERY_NOT_SPECIFIED = "Не указано"
 NO_NAME = "Без названия"
 NUMBER_NOT_SPECIFIED = "Көрсетілмеген"
+URL_NOT_SPECIFIED = "Сілтеме көрсетілмеген"
 
 
 def escape_html(text: str) -> str:
@@ -51,12 +52,13 @@ def build_message(
     delivery_place: str,
     end_date: datetime,
     remaining: timedelta,
-    url: str,
+    url: Optional[str],
 ) -> str:
     safe_name = escape_html(name or NO_NAME)
     safe_tender_number = escape_html(tender_number) if tender_number else NUMBER_NOT_SPECIFIED
     safe_lot_number = escape_html(lot_number) if lot_number else NUMBER_NOT_SPECIFIED
     safe_delivery = escape_html(delivery_place or DELIVERY_NOT_SPECIFIED)
+    safe_url = escape_html(url) if url else URL_NOT_SPECIFIED
     amount_text = format_amount(amount)
     end_date_text = format_end_date(end_date)
     remaining_text = format_remaining_kazakh(remaining)
@@ -70,5 +72,5 @@ def build_message(
         f"⏳ Аяқталу уақыты: {end_date_text}\n"
         f"⏱ Қалған уақыт: {remaining_text}\n"
         f"📍 Жеткізу орны: {safe_delivery}\n\n"
-        f"🔗 Тендерді ашу:\n{url}"
+        f"🔗 Тендерді ашу:\n{safe_url}"
     )

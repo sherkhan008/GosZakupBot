@@ -101,8 +101,9 @@ def settings(tmp_path) -> Settings:
         bootstrap_lookback_days=90,
         sync_overlap_minutes=10,
         discovery_scan_interval_minutes=120,
-        discovery_lookback_days=90,
         min_amount_kzt=100000,
+        expired_retention_days=30,
+        cleanup_interval_hours=24,
         log_level="INFO",
         keywords_path=KEYWORDS_PATH,
     )
@@ -207,6 +208,81 @@ async def test_discovery_scan_advances_pending_tender_that_was_seen_long_ago(set
     row = await repo.get_tender(66)
     assert row["status"] == "sent"
     assert len(transport.sent_messages) == 1
+
+    await _close(monitor, goszakup, telegram)
+
+
+async def test_lastUpdateDate_30_days_old_does_not_block_eligibility(settings: Settings):
+    """Exact business-rule regression test: nameRu='Металлический шкаф',
+    amount=850000, endDate=now+23h, lastUpdateDate=now-30 days. Keyword +
+    amount + remaining time all pass -> MUST be sent, regardless of how old
+    lastUpdateDate is.
+    """
+    now = datetime.now(timezone.utc)
+    end_date = (now + timedelta(hours=23)).strftime("%Y-%m-%d %H:%M:%S")
+    stale_update = (now - timedelta(days=30)).strftime("%Y-%m-%d %H:%M:%S")
+    lot = _raw_lot(70, "Металлический шкаф", end_date, stale_update, amount=850000)
+    transport = KeywordOnlyTransport({"шкаф": [lot]})
+    monitor, repo, goszakup, telegram = await _build(settings, transport)
+
+    await monitor.run_discovery_scan()
+
+    assert len(transport.sent_messages) == 1
+    assert "Металлический шкаф" in transport.sent_messages[0]["text"]
+    row = await repo.get_tender(70)
+    assert row["status"] == "sent"
+
+    await _close(monitor, goszakup, telegram)
+
+
+async def test_lastUpdateDate_365_days_old_does_not_block_eligibility(settings: Settings):
+    """Same as above but with lastUpdateDate a full year old: if the API
+    still returns the lot (nothing in our own filter would exclude it, since
+    discovery scan sends no lastUpdateDate bound at all) and keyword + amount
+    + remaining time still pass, it MUST be sent.
+    """
+    now = datetime.now(timezone.utc)
+    end_date = (now + timedelta(hours=23)).strftime("%Y-%m-%d %H:%M:%S")
+    ancient_update = (now - timedelta(days=365)).strftime("%Y-%m-%d %H:%M:%S")
+    lot = _raw_lot(71, "Металлический шкаф", end_date, ancient_update, amount=850000)
+    transport = KeywordOnlyTransport({"шкаф": [lot]})
+    monitor, repo, goszakup, telegram = await _build(settings, transport)
+
+    await monitor.run_discovery_scan()
+
+    assert len(transport.sent_messages) == 1
+    row = await repo.get_tender(71)
+    assert row["status"] == "sent"
+
+    await _close(monitor, goszakup, telegram)
+
+
+async def test_discovery_scan_sends_no_lastUpdateDate_filter_at_all(settings: Settings):
+    """Verify at the transport level that discovery scan's queries carry no
+    lastUpdateDate key whatsoever -- not an empty one, not a wide one, none.
+    """
+    now = datetime.now(timezone.utc)
+    end_date = (now + timedelta(hours=23)).strftime("%Y-%m-%d %H:%M:%S")
+    ancient_update = (now - timedelta(days=365)).strftime("%Y-%m-%d %H:%M:%S")
+    lot = _raw_lot(72, "Металлический шкаф", end_date, ancient_update, amount=850000)
+
+    seen_filters: list[dict] = []
+
+    class RecordingTransport(KeywordOnlyTransport):
+        async def handle_async_request(self, request):
+            if "goszakup" in str(request.url):
+                body = json.loads(request.content)
+                seen_filters.append(body.get("variables", {}).get("filter") or {})
+            return await super().handle_async_request(request)
+
+    transport = RecordingTransport({"шкаф": [lot]})
+    monitor, repo, goszakup, telegram = await _build(settings, transport)
+
+    await monitor.run_discovery_scan()
+
+    assert len(seen_filters) > 0
+    for filt in seen_filters:
+        assert "lastUpdateDate" not in filt
 
     await _close(monitor, goszakup, telegram)
 

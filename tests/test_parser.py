@@ -6,6 +6,7 @@ from app.goszakup.parser import (
     derive_delivery_place,
     derive_display_name,
     derive_tender_number,
+    derive_trd_buy_id,
     parse_api_datetime,
     parse_lot,
 )
@@ -13,18 +14,53 @@ from app.goszakup.parser import (
 TZ = ZoneInfo("Asia/Qyzylorda")
 
 
-def test_build_tender_url_filters_by_announcement_number():
-    url = build_tender_url("17549703-1")
-    assert url == "https://zakup.gov.kz/ru/search/announce?filter%5Bnumber%5D=17549703-1"
+def test_build_tender_url_uses_trd_buy_id():
+    url = build_tender_url(12345678)
+    assert url == "https://procurement.gov.kz/ru/announce/index/12345678"
 
 
-def test_build_tender_url_handles_missing_tender_number():
-    assert build_tender_url(None) == "https://zakup.gov.kz/"
+def test_build_tender_url_handles_missing_trd_buy_id():
+    assert build_tender_url(None) is None
 
 
-def test_build_tender_url_encodes_special_characters():
-    url = build_tender_url("17549703/1")
-    assert "17549703%2F1" in url
+def test_build_tender_url_never_uses_old_zakup_search_domain():
+    url = build_tender_url(12345678)
+    assert "zakup.gov.kz" not in url
+    assert "search/announce" not in url
+
+
+def test_url_uses_trd_buy_id_not_tender_number_when_they_differ():
+    """trdBuyNumberAnno (display number, e.g. with a "-1" lot suffix) and
+    trdBuyId (real database id) are unrelated values. The URL must be built
+    from trdBuyId only -- never from trdBuyNumberAnno, and never by parsing
+    trdBuyNumberAnno to strip a suffix and treating the remainder as an id.
+    """
+    lot = Lot(id=1, trd_buy_number_anno="17549703-1", trd_buy_id=98765)
+    assert lot.trd_buy_number_anno != str(lot.trd_buy_id)
+
+    tender_number = derive_tender_number(lot)
+    trd_buy_id = derive_trd_buy_id(lot)
+    url = build_tender_url(trd_buy_id)
+
+    assert tender_number == "17549703-1"
+    assert trd_buy_id == 98765
+    assert url == "https://procurement.gov.kz/ru/announce/index/98765"
+    assert "17549703" not in url
+
+
+def test_derive_trd_buy_id_prefers_flat_field():
+    lot = Lot(id=1, trd_buy_id=555, trd_buy=TrdBuy(id=999))
+    assert derive_trd_buy_id(lot) == 555
+
+
+def test_derive_trd_buy_id_falls_back_to_nested_trd_buy():
+    lot = Lot(id=1, trd_buy_id=None, trd_buy=TrdBuy(id=999))
+    assert derive_trd_buy_id(lot) == 999
+
+
+def test_derive_trd_buy_id_none_when_both_missing():
+    assert derive_trd_buy_id(Lot(id=1)) is None
+    assert derive_trd_buy_id(Lot(id=1, trd_buy=TrdBuy())) is None
 
 
 def test_derive_tender_number_prefers_flat_field():
@@ -46,6 +82,17 @@ def test_derive_tender_number_is_never_confused_with_lot_number():
     lot = Lot(id=1, lot_number="17549703-ОК2", trd_buy_number_anno="17549703-1")
     assert derive_tender_number(lot) == "17549703-1"
     assert derive_tender_number(lot) != lot.lot_number
+
+
+def test_parse_lot_reads_flat_trd_buy_id_distinct_from_number_anno():
+    """The API returns trdBuyId (real database id) alongside trdBuyNumberAnno
+    (display number) as separate fields -- the parser must not conflate them.
+    """
+    raw = {"id": 1, "trdBuyId": 98765, "trdBuyNumberAnno": "17549703-1"}
+    lot = parse_lot(raw)
+    assert lot.trd_buy_id == 98765
+    assert lot.trd_buy_number_anno == "17549703-1"
+    assert str(lot.trd_buy_id) != lot.trd_buy_number_anno
 
 
 def test_parse_lot_reads_flat_trd_buy_number_anno():

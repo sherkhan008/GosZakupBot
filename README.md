@@ -98,7 +98,8 @@ For every candidate, regardless of which pass found it:
   without ever having been sent, it's marked `expired` and dropped.
 - Notifications are sent via a direct Telegram Bot API call and contain only:
   name, amount, delivery location, deadline, time remaining, and a link to
-  the announcement on goszakup.gov.kz.
+  the announcement on procurement.gov.kz, built from the announcement's real
+  `trdBuyId` (never from the display-only `trdBuyNumberAnno`/`lotNumber`).
 
 Each pass logs a one-line summary (`INCREMENTAL SYNC SUMMARY` / `DISCOVERY
 SUMMARY` / `PENDING CHECK SUMMARY` / `BOOTSTRAP SUMMARY`) with counts for

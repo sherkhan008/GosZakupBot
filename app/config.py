@@ -59,10 +59,16 @@ class Settings:
     bootstrap_lookback_days: int
     sync_overlap_minutes: int
 
+    # Primary, authoritative detection mechanism (see services/monitor.py
+    # module docstring) -- a full re-scan of every keyword with NO
+    # lastUpdateDate filter. Deliberately has no "lookback days" setting:
+    # lastUpdateDate must never gate eligibility.
     discovery_scan_interval_minutes: int
-    discovery_lookback_days: int
 
     min_amount_kzt: float
+
+    expired_retention_days: int
+    cleanup_interval_hours: int
 
     log_level: str
 
@@ -93,8 +99,9 @@ def load_settings() -> Settings:
         database_path=database_path,
         bootstrap_lookback_days=_int_env("BOOTSTRAP_LOOKBACK_DAYS", 90),
         sync_overlap_minutes=_int_env("SYNC_OVERLAP_MINUTES", 10),
-        discovery_scan_interval_minutes=_int_env("DISCOVERY_SCAN_INTERVAL_MINUTES", 120),
-        discovery_lookback_days=_int_env("DISCOVERY_LOOKBACK_DAYS", 90),
+        discovery_scan_interval_minutes=_int_env("DISCOVERY_SCAN_INTERVAL_MINUTES", 60),
         min_amount_kzt=_float_env("MIN_AMOUNT_KZT", 100000),
+        expired_retention_days=_int_env("EXPIRED_RETENTION_DAYS", 30),
+        cleanup_interval_hours=_int_env("CLEANUP_INTERVAL_HOURS", 24),
         log_level=_str_env("LOG_LEVEL", "INFO"),
     )

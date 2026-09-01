@@ -24,7 +24,7 @@ class TenderRecord:
     amount: Optional[float]
     end_date: Optional[str]  # ISO 8601 string, timezone-aware
     delivery_place: str
-    tender_url: str
+    tender_url: Optional[str]
     matched_keyword: Optional[str]
     status: str = STATUS_PENDING
     first_seen_at: Optional[str] = None
@@ -166,6 +166,84 @@ class Repository:
     async def is_sent(self, lot_id: int) -> bool:
         row = await self.get_tender(lot_id)
         return row is not None and row["status"] == STATUS_SENT
+
+    async def count_tenders_by_status(self, status: str) -> int:
+        cursor = await self._conn.execute(
+            "SELECT count(*) FROM tenders WHERE status = ?", (status,)
+        )
+        row = await cursor.fetchone()
+        await cursor.close()
+        return row[0]
+
+    async def find_expired_lot_ids_older_than(self, cutoff: datetime) -> list[int]:
+        """Lot ids with status='expired' whose end_date is parseable,
+        timezone-aware, and strictly before `cutoff`. Rows with a missing,
+        malformed, or naive (ambiguous) end_date are never included -- they
+        are kept rather than risk deleting something we can't safely age.
+        """
+        cursor = await self._conn.execute(
+            "SELECT lot_id, end_date FROM tenders WHERE status = ?", (STATUS_EXPIRED,)
+        )
+        rows = await cursor.fetchall()
+        await cursor.close()
+
+        candidates: list[int] = []
+        for row in rows:
+            raw_end_date = row["end_date"]
+            if not raw_end_date:
+                continue
+            try:
+                end_date = datetime.fromisoformat(raw_end_date)
+            except ValueError:
+                continue
+            if end_date.tzinfo is None:
+                continue
+            if end_date < cutoff:
+                candidates.append(row["lot_id"])
+        return candidates
+
+    async def delete_tenders_by_ids(self, lot_ids: list[int], batch_size: int = 1000) -> int:
+        """Delete tenders by id, in batches (committing after each batch) so
+        a large deletion never holds one giant transaction. The WHERE clause
+        re-asserts status='expired' as a second, independent guard against
+        ever deleting a 'sent' or 'pending' row -- even if its status changed
+        between the candidate SELECT and this DELETE.
+        """
+        deleted = 0
+        for i in range(0, len(lot_ids), batch_size):
+            batch = lot_ids[i : i + batch_size]
+            placeholders = ",".join("?" for _ in batch)
+            cursor = await self._conn.execute(
+                f"DELETE FROM tenders WHERE status = ? AND lot_id IN ({placeholders})",
+                (STATUS_EXPIRED, *batch),
+            )
+            await self._conn.commit()
+            deleted += cursor.rowcount if cursor.rowcount and cursor.rowcount > 0 else 0
+            await cursor.close()
+        return deleted
+
+    async def get_storage_diagnostics(self) -> dict:
+        """PRAGMA-based size/free-space diagnostics. Read-only -- never
+        changes journal_mode, auto_vacuum, or runs VACUUM.
+        """
+        page_count = await self._pragma_int("page_count")
+        freelist_count = await self._pragma_int("freelist_count")
+        page_size = await self._pragma_int("page_size")
+        database_size_mb = (page_count * page_size) / (1024 * 1024)
+        reclaimable_mb = (freelist_count * page_size) / (1024 * 1024)
+        return {
+            "page_count": page_count,
+            "freelist_count": freelist_count,
+            "page_size": page_size,
+            "database_size_mb": round(database_size_mb, 2),
+            "reclaimable_mb": round(reclaimable_mb, 2),
+        }
+
+    async def _pragma_int(self, pragma_name: str) -> int:
+        cursor = await self._conn.execute(f"PRAGMA {pragma_name}")
+        row = await cursor.fetchone()
+        await cursor.close()
+        return row[0]
 
     # ------------------------------------------------------------- app_state
     async def get_app_state(self, key: str) -> Optional[str]:
