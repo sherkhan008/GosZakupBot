@@ -67,9 +67,6 @@ class Settings:
 
     min_amount_kzt: float
 
-    expired_retention_days: int
-    cleanup_interval_hours: int
-
     log_level: str
 
     keywords_path: Path = field(default_factory=lambda: BASE_DIR / "config" / "keywords.yaml")
@@ -101,7 +98,5 @@ def load_settings() -> Settings:
         sync_overlap_minutes=_int_env("SYNC_OVERLAP_MINUTES", 10),
         discovery_scan_interval_minutes=_int_env("DISCOVERY_SCAN_INTERVAL_MINUTES", 60),
         min_amount_kzt=_float_env("MIN_AMOUNT_KZT", 100000),
-        expired_retention_days=_int_env("EXPIRED_RETENTION_DAYS", 30),
-        cleanup_interval_hours=_int_env("CLEANUP_INTERVAL_HOURS", 24),
         log_level=_str_env("LOG_LEVEL", "INFO"),
     )

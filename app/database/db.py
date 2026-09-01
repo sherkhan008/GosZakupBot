@@ -9,24 +9,10 @@ import aiosqlite
 logger = logging.getLogger(__name__)
 
 SCHEMA = """
-CREATE TABLE IF NOT EXISTS tenders (
+CREATE TABLE IF NOT EXISTS sent_lots (
     lot_id INTEGER PRIMARY KEY,
-    lot_number TEXT,
-    trd_buy_id INTEGER,
-    name TEXT,
-    amount REAL,
-    end_date TEXT,
-    delivery_place TEXT,
-    tender_url TEXT,
-    matched_keyword TEXT,
-    status TEXT NOT NULL DEFAULT 'pending',
-    first_seen_at TEXT NOT NULL,
-    last_seen_at TEXT NOT NULL,
-    sent_at TEXT
+    sent_at TEXT NOT NULL
 );
-
-CREATE INDEX IF NOT EXISTS idx_tenders_status ON tenders (status);
-CREATE INDEX IF NOT EXISTS idx_tenders_trd_buy_id ON tenders (trd_buy_id);
 
 CREATE TABLE IF NOT EXISTS app_state (
     key TEXT PRIMARY KEY,

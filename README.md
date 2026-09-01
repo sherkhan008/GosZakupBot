@@ -56,34 +56,37 @@ Press `Ctrl+C`.
 
 | What | Where |
 |---|---|
-| Database (SQLite) | `data/tenders.db` — created automatically, survives restarts |
+| Database (SQLite) | `data/tenders.db` — created automatically, survives restarts. Stores only sent lot ids (`sent_lots`), `app_state`, and `settings` — no pending/expired history |
 | Keywords | `config/keywords.yaml` — edit and restart the bot to apply changes |
 | Deadline window (5h / 72h) | `.env` → `MIN_HOURS_REMAINING` / `MAX_HOURS_REMAINING` |
 | Check interval (default 5 min) | `.env` → `CHECK_INTERVAL_SECONDS` |
 | Timezone | `.env` → `APP_TIMEZONE` (default `Asia/Qyzylorda`) |
 | How far back the first sync looks | `.env` → `BOOTSTRAP_LOOKBACK_DAYS` (default 90) |
 | Periodic full keyword re-scan interval | `.env` → `DISCOVERY_SCAN_INTERVAL_MINUTES` (default 120) |
-| How far back each re-scan looks | `.env` → `DISCOVERY_LOOKBACK_DAYS` (default 90) |
 | Minimum amount to send (exclusive) | `.env` → `MIN_AMOUNT_KZT` (default 100000) |
 
 ## How it works, briefly
 
-Three independent discovery passes feed the same pipeline:
+Storage is intentionally minimal: the database holds only the ids of lots
+that were **actually sent**, purely to prevent resending. Nothing else is
+ever stored — no pending queue, no expired history, no cached tender
+details. A lot outside the 5–72h window is simply skipped; the next
+discovery cycle re-evaluates it from scratch, exactly as if seen for the
+first time. Periodic discovery is therefore the source of truth for
+everything that hasn't been sent yet.
+
+Two independent discovery passes feed the same pipeline:
 
 1. **Incremental sync** (every `CHECK_INTERVAL_SECONDS`, default 5 min): asks
    GosZakup only for lots updated since the last successful sync (with a
    small overlap window). Fast and cheap, but can only see tenders GosZakup
    has recently touched.
 2. **Discovery scan** (every `DISCOVERY_SCAN_INTERVAL_MINUTES`, default 2h):
-   re-searches every configured keyword individually over the last
-   `DISCOVERY_LOOKBACK_DAYS` days, independent of when the tender was last
-   updated. This exists because a tender's "last updated" timestamp reflects
-   when GosZakup last edited it, not when its deadline enters the 5–72h
-   window — a tender published weeks ago and never touched again would
-   otherwise be invisible to incremental sync alone.
-3. **Pending check** (every cycle): re-fetches every tender currently stored
-   as `pending` by id, so one already discovered by either pass above keeps
-   getting its deadline re-evaluated until it's sent or expires.
+   re-searches every configured keyword individually, independent of when
+   the tender was last updated. This exists because a tender's "last
+   updated" timestamp reflects when GosZakup last edited it, not when its
+   deadline enters the 5–72h window — a tender published weeks ago and never
+   touched again would otherwise be invisible to incremental sync alone.
 
 For every candidate, regardless of which pass found it:
 - The final keyword decision checks **only the tender's title** (`nameRu` /
@@ -91,19 +94,20 @@ For every candidate, regardless of which pass found it:
   candidates, but a match only counts if the keyword appears in the title
   itself.
 - It must have `amount` strictly greater than `MIN_AMOUNT_KZT`.
-- It's stored in SQLite as `pending`, then sent to Telegram **exactly once**
-  the moment its remaining time to the application deadline is between 5 and
-  72 hours (inclusive). Once sent, it's marked `sent` and never sent again,
-  even if it changes later. If it would otherwise pass the 5-hour mark
-  without ever having been sent, it's marked `expired` and dropped.
+- It's sent to Telegram **exactly once**, the moment its remaining time to
+  the application deadline is between 5 and 72 hours (inclusive) — only then
+  is its lot id written to the database, so it's never sent twice. Outside
+  that window (too early or too late) it's skipped and nothing is stored;
+  a too-early lot is simply picked up again by the next discovery cycle once
+  it enters the window.
 - Notifications are sent via a direct Telegram Bot API call and contain only:
   name, amount, delivery location, deadline, time remaining, and a link to
   the announcement on procurement.gov.kz, built from the announcement's real
   `trdBuyId` (never from the display-only `trdBuyNumberAnno`/`lotNumber`).
 
 Each pass logs a one-line summary (`INCREMENTAL SYNC SUMMARY` / `DISCOVERY
-SUMMARY` / `PENDING CHECK SUMMARY` / `BOOTSTRAP SUMMARY`) with counts for
-requests, failures, matches, and outcomes (sent/pending/expired/rejected).
+SUMMARY` / `BOOTSTRAP SUMMARY`) with counts for requests, failures, matches,
+and outcomes (sent/pending/expired/rejected).
 
 ## Running tests
 

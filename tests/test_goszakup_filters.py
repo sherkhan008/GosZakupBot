@@ -172,8 +172,6 @@ def settings(tmp_path) -> Settings:
         sync_overlap_minutes=10,
         discovery_scan_interval_minutes=120,
         min_amount_kzt=100000,
-        expired_retention_days=30,
-        cleanup_interval_hours=24,
         log_level="INFO",
         keywords_path=KEYWORDS_PATH,
     )
@@ -272,7 +270,7 @@ async def test_incremental_sync_ignores_non_matching_lots_locally(settings: Sett
 
 
 async def test_full_end_to_end_run_once_never_sends_array_filter(settings: Settings):
-    """End-to-end guard: run a full incremental sync + pending check and
+    """End-to-end guard: run a full incremental sync + discovery scan and
     verify not a single request ever violated the schema, using the same
     transport-level hard check as the live API would apply.
     """
@@ -283,7 +281,7 @@ async def test_full_end_to_end_run_once_never_sends_array_filter(settings: Setti
     monitor = await _build_monitor(settings, transport)
 
     await monitor.run_incremental_sync()
-    await monitor.run_pending_check()
+    await monitor.run_discovery_scan()
 
     for filt in transport.seen_filters:
         assert not isinstance(filt.get("nameDescriptionRu"), list)

@@ -24,13 +24,15 @@ ingest_lot's amount/deadline/dedup checks) -- everything else is optional:
     the next discovery cycle). The system is fully correct even with this
     disabled or failing indefinitely -- discovery scan alone guarantees every
     matching tender is eventually found.
-  - Pending check (run_pending_check): re-evaluates tenders already stored as
-    'pending' by id, purely as an optimization so a >72h tender doesn't have
-    to wait for the next full discovery scan once its deadline enters the
-    window. Not required for correctness either -- if a pending row were
-    ever lost, the next discovery scan would simply rediscover that same lot
-    by keyword and re-evaluate it from scratch, since discovery scan does not
-    consult or depend on pending/database state to decide what to search for.
+
+Storage is intentionally minimal: only successfully-sent lot ids are ever
+persisted (sent_lots), purely to prevent resending. A lot outside the 5-72h
+window (too early or too late) is never written to the database at all --
+it's simply skipped, and the next discovery scan re-evaluates it from
+scratch by keyword, exactly as if it were seen for the first time. There is
+no 'pending' or 'expired' storage and therefore no separate pending-refresh
+pass: periodic discovery is the sole source of truth for anything not yet
+sent.
 
 All paths funnel into ingest_lot(), which evaluates the amount filter, the
 5-72h deadline window, and duplicate protection, then sends via Telegram
@@ -45,12 +47,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from app.config import Settings
-from app.database.repository import (
-    STATUS_EXPIRED,
-    STATUS_SENT,
-    Repository,
-    TenderRecord,
-)
+from app.database.repository import Repository
 from app.filters.amount_filter import passes_amount_filter
 from app.filters.deadline_filter import DeadlineStatus, classify_deadline, remaining_timedelta
 from app.filters.keyword_filter import KeywordFilter
@@ -81,7 +78,6 @@ logger = logging.getLogger(__name__)
 LAST_SYNC_KEY = "last_successful_sync"
 BOOTSTRAP_DONE_KEY = "bootstrap_completed"
 LAST_DISCOVERY_SCAN_KEY = "last_discovery_scan"
-LAST_CLEANUP_KEY = "last_cleanup_at"
 
 PAGE_LIMIT = 200  # documented GosZakup V3 maximum page size
 KEYWORD_SEARCH_CONCURRENCY = 4  # conservative: 3-5 simultaneous requests
@@ -118,10 +114,12 @@ class MonitorService:
         self.owner_chat_id = owner_chat_id
 
     # ------------------------------------------------------------ ingestion
-    async def ingest_lot(self, lot: Lot, matched_keyword: Optional[str]) -> str:
-        """Evaluate one keyword-matched lot: amount filter, deadline
-        classification, duplicate protection, and (if eligible) Telegram
-        send. Never touches a lot that is already 'sent'. Returns one of the
+    async def ingest_lot(self, lot: Lot) -> str:
+        """Evaluate one keyword-matched lot: duplicate protection, amount
+        filter, deadline classification, and (if eligible) Telegram send.
+        Nothing is ever written to the database except sent_lots, and only
+        after a successful send -- a lot outside the 5-72h window is simply
+        skipped, with no DB row created for it. Returns one of the
         OUTCOME_* constants for funnel logging.
         """
         if await self.repo.is_sent(lot.id):
@@ -145,29 +143,6 @@ class MonitorService:
             )
             return OUTCOME_AMOUNT_REJECTED
 
-        name = derive_display_name(lot)
-        delivery_place = derive_delivery_place(lot)
-        tender_number = derive_tender_number(lot)
-        trd_buy_id = derive_trd_buy_id(lot)
-        url = build_tender_url(trd_buy_id)
-
-        record = TenderRecord(
-            lot_id=lot.id,
-            lot_number=lot.lot_number,
-            trd_buy_id=trd_buy_id,
-            name=name,
-            amount=lot.amount,
-            end_date=end_date.isoformat(),
-            delivery_place=delivery_place,
-            tender_url=url,
-            matched_keyword=matched_keyword,
-        )
-        current_status = await self.repo.upsert_candidate(record)
-        if current_status == STATUS_SENT:
-            return OUTCOME_ALREADY_SENT
-        if current_status == STATUS_EXPIRED:
-            return OUTCOME_EXPIRED
-
         now = datetime.now(timezone.utc)
         remaining = remaining_timedelta(end_date, now)
         status = classify_deadline(
@@ -175,15 +150,31 @@ class MonitorService:
         )
 
         if status == DeadlineStatus.EXPIRED:
-            await self.repo.mark_expired(lot.id)
-            logger.info("Tender %s expired without being sent (remaining=%s)", lot.id, remaining)
+            logger.info(
+                "Tender %s outside window (remaining=%s < %dh); skipped, nothing stored",
+                lot.id,
+                remaining,
+                self.settings.min_hours_remaining,
+            )
             return OUTCOME_EXPIRED
 
         if status == DeadlineStatus.PENDING:
-            logger.info("Tender %s is pending (remaining=%s, waiting for 5-72h window)", lot.id, remaining)
+            logger.info(
+                "Tender %s too early (remaining=%s > %dh); skipped, nothing stored -- "
+                "next discovery scan will re-evaluate it",
+                lot.id,
+                remaining,
+                self.settings.max_hours_remaining,
+            )
             return OUTCOME_PENDING
 
         # ELIGIBLE: recompute remaining immediately before sending (per spec) and send.
+        name = derive_display_name(lot)
+        delivery_place = derive_delivery_place(lot)
+        tender_number = derive_tender_number(lot)
+        trd_buy_id = derive_trd_buy_id(lot)
+        url = build_tender_url(trd_buy_id)
+
         now = datetime.now(timezone.utc)
         remaining = remaining_timedelta(end_date, now)
         message = build_message(
@@ -217,10 +208,8 @@ class MonitorService:
         matches: dict[int, Lot] = {}
         for lot_id, raw_lot in raw_by_id.items():
             lot = parse_lot(raw_lot)
-            matched_keyword = self.keyword_filter.match_any(title_fields(lot))
-            if matched_keyword:
+            if self.keyword_filter.match_any(title_fields(lot)):
                 matches[lot_id] = lot
-                lot._matched_keyword = matched_keyword  # type: ignore[attr-defined]
         return matches
 
     async def fetch_keyword_search_matches(
@@ -349,18 +338,18 @@ class MonitorService:
     ) -> dict[str, Any]:
         outcomes: list[str] = []
         for lot in matches.values():
-            matched_keyword = getattr(lot, "_matched_keyword", None)
-            outcome = await self.ingest_lot(lot, matched_keyword)
+            outcome = await self.ingest_lot(lot)
             outcomes.append(outcome)
         counts = Counter(outcomes)
 
         summary = dict(fetch_stats)
         summary["keyword_matches"] = len(matches)
         summary["rejected_amount"] = counts[OUTCOME_AMOUNT_REJECTED]
-        # "rejected_deadline" = remaining time < MIN_HOURS_REMAINING (DB status
-        # stays 'expired' internally; the funnel label reflects the business
+        # "rejected_deadline" = remaining time outside the 5-72h window
+        # (< MIN_HOURS_REMAINING or > MAX_HOURS_REMAINING); nothing is stored
+        # for either case, the funnel label just reflects the business
         # framing that this is a deadline-window rejection, not an
-        # lastUpdateDate-driven "staleness" concept).
+        # lastUpdateDate-driven "staleness" concept.
         summary["rejected_deadline"] = counts[OUTCOME_EXPIRED]
         summary["pending"] = counts[OUTCOME_PENDING] + counts[OUTCOME_SEND_FAILED]
         summary["already_sent"] = counts[OUTCOME_ALREADY_SENT]
@@ -439,119 +428,6 @@ class MonitorService:
                 return
         await self.run_discovery_scan()
 
-    async def run_pending_check(self) -> None:
-        pending_rows = await self.repo.get_pending_tenders()
-        if not pending_rows:
-            logger.info("Pending check: no pending tenders")
-            return
-
-        logger.info("Pending check: refreshing %d pending tender(s)", len(pending_rows))
-        pending_ids = [row["lot_id"] for row in pending_rows]
-        matched_keywords = {row["lot_id"]: row["matched_keyword"] for row in pending_rows}
-
-        try:
-            raw_lots = await self.goszakup.fetch_lots_by_ids(pending_ids)
-        except GoszakupError:
-            logger.exception("Failed to refresh pending tenders from GosZakup; will retry next cycle")
-            return
-
-        outcomes: list[str] = []
-        refreshed_ids: set[int] = set()
-        for raw_lot in raw_lots:
-            lot = parse_lot(raw_lot)
-            refreshed_ids.add(lot.id)
-            outcome = await self.ingest_lot(lot, matched_keywords.get(lot.id))
-            outcomes.append(outcome)
-
-        missing = set(pending_ids) - refreshed_ids
-        if missing:
-            logger.warning(
-                "Pending check: %d tender(s) not returned by API by-id refresh (kept pending): %s",
-                len(missing),
-                sorted(missing),
-            )
-
-        counts = Counter(outcomes)
-        logger.info(
-            "PENDING CHECK SUMMARY: checked=%d refreshed=%d missing=%d rejected_deadline=%d "
-            "pending=%d telegram_sent=%d amount_rejected=%d",
-            len(pending_ids),
-            len(refreshed_ids),
-            len(missing),
-            counts[OUTCOME_EXPIRED],
-            counts[OUTCOME_PENDING] + counts[OUTCOME_SEND_FAILED],
-            counts[OUTCOME_SENT],
-            counts[OUTCOME_AMOUNT_REJECTED],
-        )
-
-    async def run_cleanup(self) -> None:
-        """Delete old 'expired' tenders (never 'sent'/'pending') older than
-        EXPIRED_RETENTION_DAYS past their end_date. Runs on its own schedule,
-        completely independent of last_successful_sync, last_discovery_scan,
-        and bootstrap_completed.
-
-        Does NOT run VACUUM -- a full VACUUM needs up to ~2x the current file
-        size in free disk space to run safely, which the Railway Volume does
-        not currently have headroom for. Freed pages are added to SQLite's
-        internal freelist and get reused by future INSERTs automatically
-        (this is what actually stops/slows further growth); the file itself
-        will not shrink on disk until a VACUUM is run separately, once there
-        is enough free space to do so safely.
-        """
-        before = await self.repo.get_storage_diagnostics()
-        logger.info(
-            "Cleanup diagnostics (before): database_size_mb=%s freelist_pages=%d reclaimable_mb=%s",
-            before["database_size_mb"],
-            before["freelist_count"],
-            before["reclaimable_mb"],
-        )
-
-        expired_before = await self.repo.count_tenders_by_status(STATUS_EXPIRED)
-        cutoff = datetime.now(timezone.utc) - timedelta(days=self.settings.expired_retention_days)
-        candidate_ids = await self.repo.find_expired_lot_ids_older_than(cutoff)
-
-        deleted = 0
-        if candidate_ids:
-            deleted = await self.repo.delete_tenders_by_ids(candidate_ids)
-
-        after = await self.repo.get_storage_diagnostics()
-        expired_after = await self.repo.count_tenders_by_status(STATUS_EXPIRED)
-
-        logger.info(
-            "CLEANUP SUMMARY: expired_retention_days=%d expired_before=%d deleted=%d "
-            "expired_after=%d database_size_mb=%s freelist_pages=%d reclaimable_mb=%s",
-            self.settings.expired_retention_days,
-            expired_before,
-            deleted,
-            expired_after,
-            after["database_size_mb"],
-            after["freelist_count"],
-            after["reclaimable_mb"],
-        )
-
-        await self.repo.set_app_state(LAST_CLEANUP_KEY, datetime.now(timezone.utc).isoformat())
-
-    async def maybe_run_cleanup(self) -> None:
-        """Run cleanup only if CLEANUP_INTERVAL_HOURS have elapsed since the
-        last run (or it has never run). Uses its own checkpoint
-        (last_cleanup_at) -- never reads or writes last_successful_sync,
-        last_discovery_scan, or bootstrap_completed.
-        """
-        last_raw = await self.repo.get_app_state(LAST_CLEANUP_KEY)
-        if last_raw:
-            last_cleanup = datetime.fromisoformat(last_raw)
-            elapsed_hours = (datetime.now(timezone.utc) - last_cleanup).total_seconds() / 3600
-            if elapsed_hours < self.settings.cleanup_interval_hours:
-                logger.info(
-                    "Cleanup not due yet (%.1f/%d hours elapsed)",
-                    elapsed_hours,
-                    self.settings.cleanup_interval_hours,
-                )
-                return
-        await self.run_cleanup()
-
     async def run_once(self) -> None:
         await self.run_incremental_sync()
         await self.maybe_run_discovery_scan()
-        await self.run_pending_check()
-        await self.maybe_run_cleanup()

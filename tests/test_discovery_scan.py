@@ -102,8 +102,6 @@ def settings(tmp_path) -> Settings:
         sync_overlap_minutes=10,
         discovery_scan_interval_minutes=120,
         min_amount_kzt=100000,
-        expired_retention_days=30,
-        cleanup_interval_hours=24,
         log_level="INFO",
         keywords_path=KEYWORDS_PATH,
     )
@@ -139,7 +137,7 @@ async def test_incremental_sync_alone_misses_a_tender_with_stale_lastUpdateDate(
     await monitor.run_incremental_sync()
 
     assert len(transport.sent_messages) == 0
-    assert await repo.get_tender(55) is None  # never even seen
+    assert await repo.is_sent(55) is False  # never even seen
 
     await _close(monitor, goszakup, telegram)
 
@@ -164,24 +162,23 @@ async def test_discovery_scan_rediscovers_and_sends_the_same_tender(settings: Se
     assert len(transport.sent_messages) == 1
     assert "Стеллаж металлический архивный" in transport.sent_messages[0]["text"]
 
-    row = await repo.get_tender(55)
-    assert row["status"] == "sent"
+    assert await repo.is_sent(55) is True
 
     # A subsequent discovery scan re-finding the same lot must NOT resend it.
     transport.sent_messages.clear()
     await monitor.run_discovery_scan()
     assert len(transport.sent_messages) == 0
-    row = await repo.get_tender(55)
-    assert row["status"] == "sent"
+    assert await repo.is_sent(55) is True
 
     await _close(monitor, goszakup, telegram)
 
 
-async def test_discovery_scan_advances_pending_tender_that_was_seen_long_ago(settings: Settings):
+async def test_discovery_scan_rediscovers_a_tender_once_it_enters_the_window(settings: Settings):
     """A tender first discovered (e.g. by an earlier scan) with >72h remaining
-    is stored as pending; a later discovery scan, run when its deadline has
-    now entered 5-72h, must send it -- even though lastUpdateDate never
-    changed in between.
+    is skipped with nothing stored (no 'pending' persistence in the minimal
+    schema); a later discovery scan, run when its deadline has now entered
+    5-72h, must find and send it via keyword search alone -- even though
+    lastUpdateDate never changed in between.
     """
     now = datetime.now(timezone.utc)
     far_future_end = (now + timedelta(hours=200)).strftime("%Y-%m-%d %H:%M:%S")
@@ -191,8 +188,7 @@ async def test_discovery_scan_advances_pending_tender_that_was_seen_long_ago(set
     monitor, repo, goszakup, telegram = await _build(settings, transport)
 
     await monitor.run_discovery_scan()
-    row = await repo.get_tender(66)
-    assert row["status"] == "pending"
+    assert await repo.is_sent(66) is False
     assert len(transport.sent_messages) == 0
 
     # Time passes; the SAME tender's deadline is now inside 5-72h (endDate
@@ -205,8 +201,7 @@ async def test_discovery_scan_advances_pending_tender_that_was_seen_long_ago(set
     transport.lots_by_keyword["сейф"] = [lot_eligible]
 
     await monitor.run_discovery_scan()
-    row = await repo.get_tender(66)
-    assert row["status"] == "sent"
+    assert await repo.is_sent(66) is True
     assert len(transport.sent_messages) == 1
 
     await _close(monitor, goszakup, telegram)
@@ -229,8 +224,7 @@ async def test_lastUpdateDate_30_days_old_does_not_block_eligibility(settings: S
 
     assert len(transport.sent_messages) == 1
     assert "Металлический шкаф" in transport.sent_messages[0]["text"]
-    row = await repo.get_tender(70)
-    assert row["status"] == "sent"
+    assert await repo.is_sent(70) is True
 
     await _close(monitor, goszakup, telegram)
 
@@ -251,8 +245,7 @@ async def test_lastUpdateDate_365_days_old_does_not_block_eligibility(settings: 
     await monitor.run_discovery_scan()
 
     assert len(transport.sent_messages) == 1
-    row = await repo.get_tender(71)
-    assert row["status"] == "sent"
+    assert await repo.is_sent(71) is True
 
     await _close(monitor, goszakup, telegram)
 
