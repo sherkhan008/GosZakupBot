@@ -63,6 +63,7 @@ Press `Ctrl+C`.
 | Timezone | `.env` → `APP_TIMEZONE` (default `Asia/Qyzylorda`) |
 | How far back the first sync looks | `.env` → `BOOTSTRAP_LOOKBACK_DAYS` (default 90) |
 | Periodic full keyword re-scan interval | `.env` → `DISCOVERY_SCAN_INTERVAL_MINUTES` (default 120) |
+| Discovery/bootstrap concurrent request pool size | `.env` → `DISCOVERY_CONCURRENCY` (default 4) — lower it (1-2) as a safety knob on a memory-constrained deployment |
 | Minimum amount to send (exclusive) | `.env` → `MIN_AMOUNT_KZT` (default 100000) |
 
 ## How it works, briefly
@@ -108,6 +109,17 @@ For every candidate, regardless of which pass found it:
 Each pass logs a one-line summary (`INCREMENTAL SYNC SUMMARY` / `DISCOVERY
 SUMMARY` / `BOOTSTRAP SUMMARY`) with counts for requests, failures, matches,
 and outcomes (sent/pending/expired/rejected).
+
+**Memory**: every fetch is a streaming pipeline — API page → parse → title
+match → send/skip → discard → next page — never a list/dict of all results
+collected before filtering. Discovery's 92×2 keyword queries run through a
+bounded worker pool (`DISCOVERY_CONCURRENCY`, default 4); a lot matching more
+than one keyword is deduped via a lightweight set of lot ids, not full
+payloads. This is what keeps memory roughly constant whether a query returns
+a handful of lots or (as incremental sync's catch-up window historically saw)
+160,000+. A periodic `MEMORY: rss_mb=...` log line tracks actual process
+memory during long fetches (reads `/proc/self/status`, so only on Linux —
+e.g. Railway; a no-op locally on Windows/macOS).
 
 ## Running tests
 

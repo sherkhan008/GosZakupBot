@@ -171,6 +171,7 @@ def settings(tmp_path) -> Settings:
         bootstrap_lookback_days=90,
         sync_overlap_minutes=10,
         discovery_scan_interval_minutes=120,
+        discovery_concurrency=4,
         min_amount_kzt=100000,
         log_level="INFO",
         keywords_path=KEYWORDS_PATH,
@@ -207,8 +208,13 @@ async def test_bootstrap_sends_one_keyword_string_per_request(settings: Settings
     transport = RecordingGoszakupTransport(lots_by_keyword)
     monitor = await _build_monitor(settings, transport)
 
-    matches, fetch_stats = await monitor.fetch_keyword_search_matches(
-        ("2026-05-12 00:00:00", "2026-08-10 00:00:00")
+    # Both lots carry amount=100000.0, exactly the MIN_AMOUNT_KZT threshold
+    # (not strictly greater), so they pass the title-keyword match but are
+    # rejected by the amount filter inside ingest_lot -- Telegram is never
+    # called, which keeps this test independent of the transport's (Telegram-
+    # incompatible) response shape.
+    stats = await monitor.run_keyword_search(
+        ("2026-05-12 00:00:00", "2026-08-10 00:00:00"), label="TEST"
     )
 
     # Every single request's filter must satisfy the schema constraint.
@@ -224,11 +230,14 @@ async def test_bootstrap_sends_one_keyword_string_per_request(settings: Settings
     keyword_count = len(KeywordFilter.from_yaml(settings.keywords_path).keywords)
     assert len(transport.seen_filters) == keyword_count * 2
 
-    # Lot 1 was returned by TWO different keyword searches but must be merged
-    # into a single candidate by Lots.id.
-    assert set(matches.keys()) == {1, 2}
-    assert fetch_stats["api_requests"] == keyword_count * 2
-    assert fetch_stats["api_failures"] == 0
+    # Lot 1 was returned by TWO different keyword searches but must be
+    # ingested only ONCE, deduped by Lots.id via a lightweight lot-id set
+    # (not by accumulating full payloads/matches in memory).
+    assert stats["unique_lots"] == 2
+    assert stats["keyword_matches"] == 2
+    assert stats["rejected_amount"] == 2
+    assert stats["api_requests"] == keyword_count * 2
+    assert stats["api_failures"] == 0
     await _close_monitor(monitor)
 
 
@@ -239,7 +248,7 @@ async def test_incremental_sync_uses_date_only_filter_and_matches_locally(settin
     transport = RecordingGoszakupTransport(lots_by_keyword)
     monitor = await _build_monitor(settings, transport)
 
-    matches, fetch_stats = await monitor.fetch_incremental_matches(
+    stats = await monitor.process_date_range_query(
         ("2026-08-10 09:00:00", "2026-08-10 10:00:00")
     )
 
@@ -249,9 +258,9 @@ async def test_incremental_sync_uses_date_only_filter_and_matches_locally(settin
     assert "nameDescriptionKz" not in filt
     assert filt["lastUpdateDate"] == ["2026-08-10 09:00:00", "2026-08-10 10:00:00"]
 
-    assert 5 in matches
-    assert matches[5].name_ru == "Стеллаж архивный"
-    assert fetch_stats["api_requests"] == 1
+    assert stats["unique_lots"] == 1
+    assert stats["keyword_matches"] == 1
+    assert stats["api_requests"] == 1
     await _close_monitor(monitor)
 
 
@@ -262,10 +271,10 @@ async def test_incremental_sync_ignores_non_matching_lots_locally(settings: Sett
     transport = RecordingGoszakupTransport(lots_by_keyword)
     monitor = await _build_monitor(settings, transport)
 
-    matches, _fetch_stats = await monitor.fetch_incremental_matches(
+    stats = await monitor.process_date_range_query(
         ("2026-08-10 09:00:00", "2026-08-10 10:00:00")
     )
-    assert matches == {}
+    assert stats["keyword_matches"] == 0
     await _close_monitor(monitor)
 
 

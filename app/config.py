@@ -65,6 +65,12 @@ class Settings:
     # lastUpdateDate must never gate eligibility.
     discovery_scan_interval_minutes: int
 
+    # Bounded worker pool size for the 92-keyword x 2-language discovery/
+    # bootstrap search (see services/monitor.py run_keyword_search). Tunable
+    # independently of code changes as a memory/rate-limit safety knob --
+    # lower it (e.g. 1-2) if a Railway deployment is memory-constrained.
+    discovery_concurrency: int
+
     min_amount_kzt: float
 
     log_level: str
@@ -97,6 +103,7 @@ def load_settings() -> Settings:
         bootstrap_lookback_days=_int_env("BOOTSTRAP_LOOKBACK_DAYS", 90),
         sync_overlap_minutes=_int_env("SYNC_OVERLAP_MINUTES", 10),
         discovery_scan_interval_minutes=_int_env("DISCOVERY_SCAN_INTERVAL_MINUTES", 60),
+        discovery_concurrency=_int_env("DISCOVERY_CONCURRENCY", 4),
         min_amount_kzt=_float_env("MIN_AMOUNT_KZT", 100000),
         log_level=_str_env("LOG_LEVEL", "INFO"),
     )

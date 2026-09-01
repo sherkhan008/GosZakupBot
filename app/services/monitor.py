@@ -34,6 +34,17 @@ no 'pending' or 'expired' storage and therefore no separate pending-refresh
 pass: periodic discovery is the sole source of truth for anything not yet
 sent.
 
+MEMORY: every fetch path is a streaming pipeline -- API page (bounded by
+PAGE_LIMIT) -> parse -> title match -> ingest_lot() -> discard -> next page.
+Nothing here ever accumulates raw API payloads or parsed Lot objects across
+pages/queries; the only per-run structures held in memory are small,
+constant-ish-size counters (a stats dict) and, during a multi-keyword
+discovery/bootstrap search, a lightweight set of already-seen lot ids
+(ints only, never full payloads) used to dedup the same lot appearing under
+multiple keywords. This is what keeps memory roughly constant regardless of
+whether a query returns a handful of lots or hundreds of thousands (as
+incremental sync historically did after a long catch-up window).
+
 All paths funnel into ingest_lot(), which evaluates the amount filter, the
 5-72h deadline window, and duplicate protection, then sends via Telegram
 exactly once.
@@ -42,7 +53,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections import Counter
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
@@ -70,6 +80,7 @@ from app.goszakup.queries import (
     build_date_range_filter,
     build_single_keyword_filter,
 )
+from app.memory_utils import get_rss_mb
 from app.telegram.client import TelegramClient, TelegramError
 from app.telegram.formatter import build_message
 
@@ -80,7 +91,11 @@ BOOTSTRAP_DONE_KEY = "bootstrap_completed"
 LAST_DISCOVERY_SCAN_KEY = "last_discovery_scan"
 
 PAGE_LIMIT = 200  # documented GosZakup V3 maximum page size
-KEYWORD_SEARCH_CONCURRENCY = 4  # conservative: 3-5 simultaneous requests
+
+# How often (in lots streamed) to emit a periodic MEMORY log line during a
+# long-running fetch -- frequent enough to catch a real leak developing,
+# far too infrequent to spam logs even across a 160k-lot catch-up run.
+MEMORY_LOG_EVERY_N_LOTS = 500
 
 # ingest_lot() outcomes, used both for control flow and funnel counting.
 OUTCOME_ALREADY_SENT = "already_sent"
@@ -90,6 +105,54 @@ OUTCOME_EXPIRED = "expired"
 OUTCOME_PENDING = "pending"
 OUTCOME_SENT = "sent"
 OUTCOME_SEND_FAILED = "send_failed"
+
+
+def _new_stats(keywords_loaded: int) -> dict[str, Any]:
+    return {
+        "keywords_loaded": keywords_loaded,
+        "api_requests": 0,
+        "api_failures": 0,
+        "lots_received": 0,
+        "unique_lots": 0,
+        "keyword_matches": 0,
+        "rejected_amount": 0,
+        "rejected_deadline": 0,
+        "pending": 0,
+        "already_sent": 0,
+        "telegram_sent": 0,
+        "missing_end_date": 0,
+    }
+
+
+def _record_outcome(stats: dict[str, Any], outcome: str) -> None:
+    if outcome == OUTCOME_AMOUNT_REJECTED:
+        stats["rejected_amount"] += 1
+    elif outcome == OUTCOME_EXPIRED:
+        stats["rejected_deadline"] += 1
+    elif outcome in (OUTCOME_PENDING, OUTCOME_SEND_FAILED):
+        stats["pending"] += 1
+    elif outcome == OUTCOME_ALREADY_SENT:
+        stats["already_sent"] += 1
+    elif outcome == OUTCOME_SENT:
+        stats["telegram_sent"] += 1
+    elif outcome == OUTCOME_MISSING_END_DATE:
+        stats["missing_end_date"] += 1
+
+
+def _log_summary(label: str, stats: dict[str, Any]) -> None:
+    logger.info("%s SUMMARY: %s", label, " ".join(f"{k}={v}" for k, v in stats.items()))
+
+
+def _log_memory(label: str, phase: str, stats: dict[str, Any]) -> None:
+    rss_mb = get_rss_mb()
+    logger.info(
+        "MEMORY: rss_mb=%s stage=%s phase=%s lots_received=%d unique_lots=%d",
+        f"{rss_mb:.1f}" if rss_mb is not None else "unavailable",
+        label,
+        phase,
+        stats["lots_received"],
+        stats["unique_lots"],
+    )
 
 
 def chunk(items: list, size: int) -> list[list]:
@@ -198,171 +261,156 @@ class MonitorService:
         logger.info("Telegram notification sent for tender %s (remaining=%s)", lot.id, remaining)
         return OUTCOME_SENT
 
-    # ------------------------------------------------------------- fetching
-    def _apply_local_match(self, raw_by_id: dict[int, dict]) -> dict[int, Lot]:
-        """The local keyword filter is the final authority, and per the
-        title-only matching rule it checks ONLY Lots.nameRu / Lots.nameKz --
-        NOT descriptions, TrdBuy names, or Plan text -- even though those
-        fields may have been used server-side to find candidates.
-        """
-        matches: dict[int, Lot] = {}
-        for lot_id, raw_lot in raw_by_id.items():
-            lot = parse_lot(raw_lot)
-            if self.keyword_filter.match_any(title_fields(lot)):
-                matches[lot_id] = lot
-        return matches
+    # ------------------------------------------------- streaming ingestion
+    async def _ingest_one(
+        self,
+        raw_lot: dict[str, Any],
+        stats: dict[str, Any],
+        seen_lot_ids: Optional[set[int]] = None,
+    ) -> None:
+        """Process exactly one raw lot dict end-to-end -- parse, apply the
+        title-only local keyword match, and (if matched) run ingest_lot --
+        then let it go out of scope. Callers must stream raw_lot values one
+        at a time (e.g. from fetch_lots_paginated) and never collect them
+        into a list/dict first: this method is the only place a raw payload
+        or parsed Lot exists, and only for the duration of this call, which
+        is what keeps memory roughly constant regardless of how many lots
+        are streamed through in total.
 
-    async def fetch_keyword_search_matches(
-        self, last_update_range: Optional[tuple[str, str]]
-    ) -> tuple[dict[int, Lot], dict[str, Any]]:
-        """Search GosZakup one keyword at a time (String, never a list) across
-        both language fields, with pagination per query and concurrency
-        limited via a semaphore. Used by BOTH the one-time bootstrap (with a
-        bounded lastUpdateDate window, purely to keep the very first run
-        fast) and the recurring discovery scan (with last_update_range=None
-        -- no date bound at all, since discovery scan is the authoritative,
+        seen_lot_ids, if given, is a lightweight cross-query dedup set (lot
+        ids only, never full payloads/Lot objects) so the same lot returned
+        by two different keyword/language queries in one discovery or
+        bootstrap run is ingested only once -- this also prevents a
+        duplicate Telegram send that could otherwise race across concurrent
+        keyword tasks for the same lot.
+        """
+        stats["lots_received"] += 1
+        lot_id = raw_lot.get("id")
+        if lot_id is None:
+            return
+        if seen_lot_ids is not None:
+            if lot_id in seen_lot_ids:
+                return
+            seen_lot_ids.add(lot_id)
+        stats["unique_lots"] += 1
+
+        lot = parse_lot(raw_lot)
+        # The local keyword filter is the final authority, and per the
+        # title-only matching rule it checks ONLY Lots.nameRu / Lots.nameKz
+        # -- NOT descriptions, TrdBuy names, or Plan text -- even though
+        # those fields may have been used server-side to find candidates.
+        if not self.keyword_filter.match_any(title_fields(lot)):
+            return
+        stats["keyword_matches"] += 1
+
+        outcome = await self.ingest_lot(lot)
+        _record_outcome(stats, outcome)
+
+    async def process_date_range_query(self, last_update_range: tuple[str, str]) -> dict[str, Any]:
+        """Normal 5-minute cycle: a single date-only query (no server-side
+        keyword search at all), streamed page-by-page -- each raw lot is
+        matched locally (title-only, all 92 keywords) and ingested
+        immediately, never accumulated into a list/dict first. This is what
+        keeps a large catch-up window (historically up to 160k+ lots after
+        an outage) from ever holding more than one page's worth of raw
+        payloads in memory at a time.
+        """
+        filt = build_date_range_filter(last_update_range)
+        assert "nameDescriptionRu" not in filt and "nameDescriptionKz" not in filt
+
+        stats = _new_stats(len(self.keyword_filter.keywords))
+        stats["api_requests"] = 1
+        _log_memory("INCREMENTAL SYNC", "start", stats)
+        async for raw_lot in self.goszakup.fetch_lots_paginated(filt, limit=PAGE_LIMIT):
+            await self._ingest_one(raw_lot, stats)
+            if stats["lots_received"] % MEMORY_LOG_EVERY_N_LOTS == 0:
+                _log_memory("INCREMENTAL SYNC", "progress", stats)
+        _log_memory("INCREMENTAL SYNC", "end", stats)
+        return stats
+
+    async def run_keyword_search(
+        self, last_update_range: Optional[tuple[str, str]], label: str
+    ) -> dict[str, Any]:
+        """Search GosZakup one keyword at a time (String, never a list)
+        across both language fields, with a bounded worker pool
+        (settings.discovery_concurrency) of concurrent keyword/language
+        pipelines. Used by BOTH the one-time bootstrap (with a bounded
+        lastUpdateDate window, purely to keep the very first run fast) and
+        the recurring discovery scan (with last_update_range=None -- no
+        date bound at all, since discovery scan is the authoritative,
         lastUpdateDate-independent detection mechanism).
 
-        Returns (matches, fetch_stats) where fetch_stats carries the raw
-        funnel numbers (requests issued/failed, lots received/deduped).
+        Each pipeline streams its own pages directly into _ingest_one as
+        they arrive -- no query's results are ever collected into a list
+        first, and no more than settings.discovery_concurrency pipelines
+        run at once, so total memory stays roughly constant regardless of
+        how many of the 184 (92 keywords x 2 languages) queries there are
+        or how many lots any one of them returns. Cross-query duplicates
+        (the same lot matching more than one keyword) are deduped via a
+        single shared set of lot ids, never full payloads.
+
+        Returns the aggregated stats dict; raises GoszakupError only if
+        every single query failed.
         """
         keywords = self.keyword_filter.keywords
+        stats = _new_stats(len(keywords))
         if not keywords:
-            return {}, {
-                "keywords_loaded": 0,
-                "api_requests": 0,
-                "api_failures": 0,
-                "lots_received": 0,
-                "unique_lots": 0,
-            }
+            _log_summary(label, stats)
+            return stats
 
-        semaphore = asyncio.Semaphore(KEYWORD_SEARCH_CONCURRENCY)
+        semaphore = asyncio.Semaphore(self.settings.discovery_concurrency)
         query_plan = [
             (keyword, field)
             for keyword in keywords
             for field in (NAME_DESCRIPTION_RU, NAME_DESCRIPTION_KZ)
         ]
+        seen_lot_ids: set[int] = set()
 
-        async def fetch_one(keyword: str, field: str) -> tuple[bool, list[dict]]:
+        async def run_one(keyword: str, field: str) -> None:
             filt = build_single_keyword_filter(
                 keyword=keyword, field=field, last_update_date_range=last_update_range
             )
             assert isinstance(filt.get(field), str), "keyword filter must be a single string"
+            stats["api_requests"] += 1
             async with semaphore:
                 try:
-                    pages = [
-                        raw_lot
-                        async for raw_lot in self.goszakup.fetch_lots_paginated(filt, limit=PAGE_LIMIT)
-                    ]
-                    return True, pages
+                    async for raw_lot in self.goszakup.fetch_lots_paginated(filt, limit=PAGE_LIMIT):
+                        await self._ingest_one(raw_lot, stats, seen_lot_ids)
+                        if stats["lots_received"] % MEMORY_LOG_EVERY_N_LOTS == 0:
+                            _log_memory(label, "progress", stats)
                 except GoszakupError:
+                    stats["api_failures"] += 1
                     logger.warning(
                         "Keyword search query failed for field=%s (this keyword/language "
                         "skipped this run, others continue)",
                         field,
                         exc_info=True,
                     )
-                    return False, []
 
         logger.info(
             "Keyword search: issuing %d single-keyword queries (%d keywords x 2 languages, concurrency=%d)",
             len(query_plan),
             len(keywords),
-            KEYWORD_SEARCH_CONCURRENCY,
+            self.settings.discovery_concurrency,
         )
-        results = await asyncio.gather(*(fetch_one(kw, field) for kw, field in query_plan))
+        _log_memory(label, "start", stats)
+        await asyncio.gather(*(run_one(kw, field) for kw, field in query_plan))
+        _log_memory(label, "end", stats)
 
-        successes = sum(1 for ok, _ in results if ok)
-        failures = len(results) - successes
-        if successes == 0 and len(results) > 0:
-            raise GoszakupError(f"All {len(results)} keyword search queries failed")
-        if failures:
+        if stats["api_requests"] > 0 and stats["api_failures"] == stats["api_requests"]:
+            raise GoszakupError(f"All {stats['api_requests']} keyword search queries failed")
+        if stats["api_failures"]:
             logger.warning(
                 "Keyword search: %d of %d queries failed and were skipped this run",
-                failures,
-                len(results),
+                stats["api_failures"],
+                stats["api_requests"],
             )
 
-        raw_by_id: dict[int, dict] = {}
-        lots_received = 0
-        for ok, pages in results:
-            if not ok:
-                continue
-            lots_received += len(pages)
-            for raw_lot in pages:
-                lot_id = raw_lot.get("id")
-                if lot_id is not None:
-                    raw_by_id[lot_id] = raw_lot
-
-        matches = self._apply_local_match(raw_by_id)
-        fetch_stats = {
-            "keywords_loaded": len(keywords),
-            "api_requests": len(query_plan),
-            "api_failures": failures,
-            "lots_received": lots_received,
-            "unique_lots": len(raw_by_id),
-        }
-        return matches, fetch_stats
-
-    async def fetch_incremental_matches(
-        self, last_update_range: tuple[str, str]
-    ) -> tuple[dict[int, Lot], dict[str, Any]]:
-        """Normal 5-minute cycle: a single date-only query (no server-side
-        keyword search at all), then all 92 keywords are matched locally
-        (title-only) against every lot returned.
-        """
-        filt = build_date_range_filter(last_update_range)
-        assert "nameDescriptionRu" not in filt and "nameDescriptionKz" not in filt
-
-        raw_by_id: dict[int, dict] = {}
-        lots_received = 0
-        async for raw_lot in self.goszakup.fetch_lots_paginated(filt, limit=PAGE_LIMIT):
-            lots_received += 1
-            lot_id = raw_lot.get("id")
-            if lot_id is not None:
-                raw_by_id[lot_id] = raw_lot
-
-        matches = self._apply_local_match(raw_by_id)
-        fetch_stats = {
-            "keywords_loaded": len(self.keyword_filter.keywords),
-            "api_requests": 1,
-            "api_failures": 0,
-            "lots_received": lots_received,
-            "unique_lots": len(raw_by_id),
-        }
-        return matches, fetch_stats
-
-    # ------------------------------------------------------------- summary
-    async def _ingest_and_summarize(
-        self, matches: dict[int, Lot], fetch_stats: dict[str, Any], label: str
-    ) -> dict[str, Any]:
-        outcomes: list[str] = []
-        for lot in matches.values():
-            outcome = await self.ingest_lot(lot)
-            outcomes.append(outcome)
-        counts = Counter(outcomes)
-
-        summary = dict(fetch_stats)
-        summary["keyword_matches"] = len(matches)
-        summary["rejected_amount"] = counts[OUTCOME_AMOUNT_REJECTED]
-        # "rejected_deadline" = remaining time outside the 5-72h window
-        # (< MIN_HOURS_REMAINING or > MAX_HOURS_REMAINING); nothing is stored
-        # for either case, the funnel label just reflects the business
-        # framing that this is a deadline-window rejection, not an
-        # lastUpdateDate-driven "staleness" concept.
-        summary["rejected_deadline"] = counts[OUTCOME_EXPIRED]
-        summary["pending"] = counts[OUTCOME_PENDING] + counts[OUTCOME_SEND_FAILED]
-        summary["already_sent"] = counts[OUTCOME_ALREADY_SENT]
-        summary["telegram_sent"] = counts[OUTCOME_SENT]
-        summary["missing_end_date"] = counts[OUTCOME_MISSING_END_DATE]
-
-        logger.info(
-            "%s SUMMARY: %s", label, " ".join(f"{k}={v}" for k, v in summary.items())
-        )
-        return summary
+        _log_summary(label, stats)
+        return stats
 
     # ------------------------------------------------------------- pipeline
-    async def run_incremental_sync(self) -> None:
+    async def run_incremental_sync(self) -> Optional[dict[str, Any]]:
         now = datetime.now(timezone.utc)
         last_sync_raw = await self.repo.get_app_state(LAST_SYNC_KEY)
         if last_sync_raw:
@@ -376,17 +424,17 @@ class MonitorService:
 
         logger.info("Incremental sync: window %s -> %s", from_str, to_str)
         try:
-            matches, fetch_stats = await self.fetch_incremental_matches((from_str, to_str))
+            stats = await self.process_date_range_query((from_str, to_str))
         except GoszakupError:
             logger.error("Incremental sync aborted due to API error; checkpoint not advanced")
-            return
+            return None
 
-        await self._ingest_and_summarize(matches, fetch_stats, "INCREMENTAL SYNC")
-
+        _log_summary("INCREMENTAL SYNC", stats)
         await self.repo.set_app_state(LAST_SYNC_KEY, now.isoformat())
         logger.info("Incremental sync completed successfully")
+        return stats
 
-    async def run_discovery_scan(self) -> None:
+    async def run_discovery_scan(self) -> Optional[dict[str, Any]]:
         """Periodic (DISCOVERY_SCAN_INTERVAL_MINUTES) re-scan of ALL keywords,
         with NO lastUpdateDate filter whatsoever -- this is the primary,
         authoritative detection mechanism (see module docstring). A tender
@@ -402,15 +450,14 @@ class MonitorService:
         now = datetime.now(timezone.utc)
         logger.info("Discovery scan started: re-scanning all keywords (no lastUpdateDate filter)")
         try:
-            matches, fetch_stats = await self.fetch_keyword_search_matches(None)
+            stats = await self.run_keyword_search(None, label="DISCOVERY")
         except GoszakupError:
             logger.error("Discovery scan aborted due to a GosZakup API error; will retry next cycle")
-            return
-
-        await self._ingest_and_summarize(matches, fetch_stats, "DISCOVERY")
+            return None
 
         await self.repo.set_app_state(LAST_DISCOVERY_SCAN_KEY, now.isoformat())
         logger.info("Discovery scan completed successfully")
+        return stats
 
     async def maybe_run_discovery_scan(self) -> None:
         """Run the discovery scan only if DISCOVERY_SCAN_INTERVAL_MINUTES

@@ -122,6 +122,7 @@ def settings(tmp_path) -> Settings:
         bootstrap_lookback_days=90,
         sync_overlap_minutes=10,
         discovery_scan_interval_minutes=120,
+        discovery_concurrency=4,
         min_amount_kzt=100000,
         log_level="INFO",
         keywords_path=KEYWORDS_PATH,

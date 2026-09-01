@@ -36,12 +36,10 @@ async def run_bootstrap(monitor: MonitorService) -> None:
     )
 
     try:
-        matches, fetch_stats = await monitor.fetch_keyword_search_matches((from_str, to_str))
+        await monitor.run_keyword_search((from_str, to_str), label="BOOTSTRAP")
     except GoszakupError:
         logger.error("Bootstrap aborted due to a GosZakup API error; will retry on next start")
         return
-
-    await monitor._ingest_and_summarize(matches, fetch_stats, "BOOTSTRAP")
 
     await monitor.repo.set_app_state(LAST_SYNC_KEY, now.isoformat())
     await monitor.repo.set_app_state(BOOTSTRAP_DONE_KEY, "1")
